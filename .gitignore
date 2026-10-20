@@ -1,0 +1,18 @@
+# Nim builds executables without an extension on Linux/macOS (e.g. tests/tfit),
+# so ignore every extensionless file, keeping directories and files with an
+# extension. Add a `!name` line here for any extensionless file to track.
+*
+!*/
+!*.*
+
+# Compiled output with an extension
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+*.out
+
+# Nim build cache
+nimcache/
