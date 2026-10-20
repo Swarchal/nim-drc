@@ -20,6 +20,7 @@ Requires Nim ≥ 2.0. From a clone of this repository:
 ```sh
 nimble install    # or: nimble develop
 nimble test       # run the test suite
+nimble figures    # re-render the README figures (needs nim-plotter and vl-convert)
 ```
 
 ## The models
@@ -78,6 +79,11 @@ Residual standard error: 0.519626 on 20 degrees of freedom
 R²: 0.978252   AIC: 42.3103   BIC: 48.2006
 Stopped after 7 iterations: relative change in SSR below ftol
 ```
+
+The same fit with its 95% confidence and prediction bands (see below). The
+untreated controls are in the fit but can't be drawn on a log axis:
+
+![4PL fit of the ryegrass data with confidence and prediction bands](docs/images/ryegrass.png)
 
 ### Normalised data with fixed plateaus
 
@@ -144,6 +150,8 @@ Stopped after 12 iterations: relative change in SSR below ftol
 The lower AIC says the asymmetry is real. Note that EC50 (226 nM) is not
 10^LogEC50 (829 nM) here. 5PL parameters are strongly correlated and need
 data across both plateaus; prefer the 4PL unless the asymmetry is clear.
+
+![4PL and 5PL fits of asymmetric data](docs/images/asymmetric.png)
 
 ### ECx values, predictions and model comparison
 
@@ -267,6 +275,8 @@ gross errors added. Both robust fits land much closer than least squares, with
 narrower intervals. Tukey also rejected well 9, a genuine but unusually high
 point. Rejection is automatic, so check `robustWeights` before trusting it.
 
+![least squares, Huber and Tukey fits of data with outliers](docs/images/robust.png)
+
 How a robust fit works:
 - **The method** is M-estimation by iteratively reweighted least squares, as
   R's `robustbase::nlrob`. Residuals are scaled by their robust spread
@@ -345,6 +355,8 @@ EC50 of run 1 / run 8: 1.074 (95% CI 1.033–1.117)
 
 Here the F test finds no evidence against parallel curves (p = 0.074), so the
 shared-slope model is a fair basis for the potency ratio.
+
+![parallel 4PL curves fitted jointly to three DNase runs](docs/images/multi.png)
 
 - **`fit.curves[c]`** is curve c as an ordinary `DrcFit`, so `ec50`, `ecxCI`,
   `predict` and the bands work on it. Its covariance is curve c's block of the
