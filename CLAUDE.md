@@ -19,18 +19,19 @@ nim c -r -d:release --path:src <file>.nim          # benchmarks / timing
 
 The layers, from bottom to top:
 
-- `src/drc/linalg.nim`: Cholesky solve and inverse for fixed-size `array[K, array[K, float]]`, plus `pinFixed`, which decouples fixed parameters in a linear system.
-- `src/drc/lm.nim` and `src/drc/neldermead.nim`: generic optimisers over `[K: static int; F]`. `F` is any callable model `fn(x, p, var grad): float` (or `f(p): float` for Nelder–Mead), so closures work. `normalEquations` returns the true JᵀWJ. Pinning is applied only to the per-solve copy (in LM) or the per-covariance copy (`stats.unscaledCovariance`).
+- `src/drc/linalg.nim`: Cholesky solve and inverse, plus `pinFixed`, which decouples fixed parameters in a linear system. **Container-generic:** every routine takes fixed-size `array[N, …]` (single-curve fits) or runtime-sized `seq` (joint fits); `ensureLen`/`ensureShape`/`setZero` are no-ops for arrays, so the array code is what it was before.
+- `src/drc/lm.nim` and `src/drc/neldermead.nim`: generic optimisers. `F` is any callable model `fn(x, p, var grad): float` (or `f(p): float` for Nelder–Mead), so closures work. LM's body is the private `lmCore`, with two public overloads: `[K: static int]` arrays → `LMResult[K]`, and `seq` → `LMDynResult`. `normalEquations` returns the true JᵀWJ. Pinning is applied only to the per-solve copy (in LM) or the per-covariance copy (`stats.unscaledCovariance`). Nelder–Mead is array-only.
 - `src/drc/robust.nim`: Huber/Tukey ψ, weights ψ(u)/u, ψ′, and the MAD scale (median|r|/0.6745, as `nlrob`/`rlm`).
-- `src/drc/stats.nim`: incomplete beta, Student t CDF/quantile (Newton inside a bisection bracket), covariance, Gaussian log-likelihood matching R's `logLik.nls`.
+- `src/drc/stats.nim`: incomplete beta, Student t CDF/quantile (Newton inside a bisection bracket), F upper tail (`fTail`), covariance, Gaussian log-likelihood matching R's `logLik.nls`.
 - `src/drc/models.nim`: **one model, `ll5`** (five-parameter logistic in x = log10 dose), plus `drcGuess` for starting values.
 - `src/drc.nim`: public API. `fitLL3`/`fitLL4`/`fitLL5` are thin wrappers over a single private `fitCurve`. It returns a `DrcFit`.
+- `src/drc/multi.nim`: joint fits of several curves (`fitLL4Multi` etc. → `MultiFit`, `relativePotency`, `fTest`). It is `include`d at the end of `drc.nim` (not imported), so it can use that module's private helpers (`fitCurve`, `logEcxAndGradient`, `tQuantile`, `resolveFixed`, …).
 
 Design decisions that span files:
 
 - **4PL is 5PL with `Asymmetry` fixed at 1, and 3PL is 4PL with `Bottom` fixed.** There is one parameter enum, `DrcParam`. Separate per-model enums can't work: Nim can't resolve duplicate enum member names inside `fixed = [(Bottom, 0.0)]`. For 3PL/4PL fits, `fit.fixed` therefore always contains `Asymmetry`.
 - **Parameter vectors have two representations.** Optimisers and models use positional `array[drcParamCount, float]` indexed with `ord(Param)`. `DrcFit` exposes `array[DrcParam, float]`, and `toVec`/`toParams` convert at the boundary. Avoid generic type aliases with `static int` params (e.g. `Vec[N] = array[N, float]`): they broke type matching for `var` params.
-- **Aliasing:** Nim passes arrays larger than 24 bytes by reference and builds a call's result in place, so in `r.fit = levenbergMarquardt(..., r.fit.params, ...)` the start and the result share memory. `levenbergMarquardt` is `{.noinit.}` and resets `result` only after copying `p0`, so this is safe (tested in `tests/tfit.nim`). A new proc that takes a large array and returns a plain object (no `seq`/`string` fields) needs the same treatment; results with such fields go through a temporary, so `irls` is unaffected.
+- **Aliasing:** Nim passes arrays larger than 24 bytes by reference and builds a call's result in place, so in `r.fit = levenbergMarquardt(..., r.fit.params, ...)` the start and the result share memory. The array `levenbergMarquardt` is `{.noinit.}`, and `lmCore` resets its result only after copying `p0`, so this is safe (tested in `tests/tfit.nim`). A new proc that takes a large array and returns a plain object (no `seq`/`string` fields) needs the same treatment. Results with such fields go through a temporary, so `irls` and the `seq` LM overload are unaffected (tested in `tests/tmulti.nim`); never put `{.noinit.}` on those, since resetting an uninitialised seq frees garbage.
 - **Zero doses** become x = -Inf. `ll5` returns the low-dose plateau limit there, so controls stay in the data. Hill = 0 is handled as a flat curve.
 - **In 5PL, `LogEC50` is a location parameter, not log10(EC50).** `ec50`/`ecx` solve for the actual dose; `logEcxAndGradient` gives the delta-method gradient that includes Asymmetry.
 - **Fit pipeline** (`fitCurve` → `searchLM`):
@@ -43,15 +44,21 @@ Design decisions that span files:
 - **Convergence:** `LMStatus.converged` includes `lmStationary` (no downhill step and gradient ≈ 0, or a near-perfect fit) but not `lmStalled`. After the fallback, `DrcFit.converged` can be true while `status` (the final LM polish) is not; `fallbackConverged` records the fallback's own outcome. `DrcFit.converged` is false exactly when `fwNotConverged` or `fwRobustNotConverged` is set.
 - **Fixed parameters:** standard error 0, covariance rows 0, and they don't count toward `df`/AIC. Standard errors are NaN when unidentifiable or when df = 0, and problems are reported in `fit.warnings`, not raised. Invalid input raises `ValueError`.
 - **Weights** are relative (variance σ²/wᵢ, as in R's `nls`). Zero-weight points are excluded from `n`, `df`, AIC and the starting guess.
+- **Joint fits** (`fitMulti`):
+  - The joint vector has one slot per shared parameter and one per curve for each unshared one, ordered by `DrcParam` then curve; `index[c][param]` is the slot. Fixed parameters are global, count as shared, and are pinned with the usual machinery.
+  - LM sees the observation index as x, and a closure maps the joint vector to that observation's curve's 5-vector, calls `ll5` and scatters the gradient.
+  - Starts come from per-curve `fitCurve` fits (falling back to `drcGuess` for curves too small to fit alone), with shared parameters at the median over curves, plus a start from the pooled fit. The multi-start grid and the symmetric-then-asymmetric 5PL stage mirror `searchLM`. There is no Nelder–Mead fallback, and robust losses raise `ValueError`.
+  - `fit.curves[c]` is a `DrcFit` view: curve c's 5×5 covariance block, the joint df and pooled σ, its own n/ssr/R²/dose range. `logLik`/`aic`/`bic` are NaN on views, so single-curve inference works on them unchanged.
 
 ## Testing conventions
 
 - Numeric results are validated against **external references**, not against this code's own output. The reference values are hard-coded in the tests:
-  - R `nls`, `qt`, `pt` and `pbeta`.
+  - R `nls` (joint fits use indexed parameters, e.g. `l[c]`), `anova`, `qt`, `pt`, `pbeta` and `pf`.
   - `robustbase::nlrob` for robust fits.
   - SciPy `curve_fit`.
   - `drc`'s published ryegrass estimates (the data are in `tests/ryegrass.nim`).
 - R's `drc` package is not installed. Base R (`Rscript`, with `MASS` and `robustbase`) and Python with SciPy are.
 - When adding a numeric feature, compute the reference independently: R/SciPy, or finite differences for gradients. `tests/tmodels.nim` checks every analytic gradient against central differences.
 - Synthetic-data tests write out the curve formula on purpose, as an independent check on `ll5`.
+- R's `nls` stops at its relative-offset tolerance (1e-5, and it fails to converge if tightened on these data), so it can be ~1e-7 short of the optimum. Compare estimates against it in units of their standard error (`near` in `tests/tmulti.nim`, 2e-5·SE), not relative to the value; a Bottom near 0 fails relative checks.
 - **Keep README examples truthful.** Their output blocks are copied from real runs, so re-run the snippets after behaviour changes.

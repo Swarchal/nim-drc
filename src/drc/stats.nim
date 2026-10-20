@@ -97,22 +97,28 @@ func studentTQuantile*(p, df: float): float =
     t = next
   t
 
-proc unscaledCovariance*[K: static int](
-    jtwj: array[K, array[K, float]];
-    free: array[K, bool];
-    cov: var array[K, array[K, float]]
-): bool =
+proc unscaledCovariance*[M, B](jtwj: M; free: B; cov: var M): bool =
   ## (JᵀWJ)⁻¹ over the free parameters, with zero rows and columns for fixed
   ## ones. Multiply by σ² for the parameter covariance. If the free parameters
   ## are not identifiable (JᵀWJ is singular) their entries are NaN and the
-  ## result is false.
+  ## result is false. Works on fixed-size arrays or seqs, as `linalg`.
+  let n = jtwj.len
   var m = jtwj
   pinFixed(m, free)
+  cov.ensureShape n
   result = invertSpd(m, cov)
-  for j in 0 ..< K:
-    for k in 0 ..< K:
+  for j in 0 ..< n:
+    for k in 0 ..< n:
       if not (free[j] and free[k]): cov[j][k] = 0.0
       elif not result: cov[j][k] = NaN
+
+func fTail*(f, df1, df2: float): float =
+  ## P(F > f) for the F distribution with `df1` and `df2` degrees of freedom.
+  if f.isNaN or not (df1 > 0.0 and df2 > 0.0): return NaN
+  if f <= 0.0: return 1.0
+  if f == Inf: return 0.0
+  let d = df2 + df1 * f
+  incompleteBeta(0.5 * df2, 0.5 * df1, df2 / d, df1 * f / d)
 
 func gaussianLogLik*(ssr: float; n: int; sumLogWeights = 0.0): float =
   ## Maximised log-likelihood of a least-squares fit with normal errors,

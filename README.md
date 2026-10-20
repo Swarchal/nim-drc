@@ -9,6 +9,8 @@ Dose-response curve fitting for Nim, with no dependencies beyond the standard li
 - Standard errors, t-based confidence intervals, R², AIC/BIC
 - EC50 and any ECx (EC10, EC90, …) with confidence intervals
 - Confidence and prediction bands for the fitted curve
+- Joint fits of several curves with shared parameters (e.g. parallel curves),
+  relative potency with confidence intervals, and F tests between nested fits
 - Results validated against R (`nls`, `robustbase::nlrob`, and the published `drc` estimates for its `ryegrass` dataset)
 
 ## Installation
@@ -282,6 +284,83 @@ How a robust fit works:
 - **`fit.robustWeights`** holds each observation's final weight: 1 means not
   downweighted, 0 means rejected.
 
+### Several curves: shared parameters and relative potency
+
+`fitLL4Multi` (and `fitLL3Multi`, `fitLL5Multi`) fits several curves in one
+least-squares fit, like R drc's `curveid` with `pmodels`. Each observation
+carries a curve id, and the parameters in `shared` take one value for all
+curves. Sharing Bottom, Top and Hill fits parallel curves that differ only in
+EC50, the usual model for a relative potency assay:
+
+```nim
+import std/strformat
+import drc
+
+# R's DNase assay, runs 1, 4 and 8: duplicate wells at eight concentrations
+let conc = [0.04882812, 0.1953125, 0.390625, 0.78125, 1.5625, 3.125, 6.25, 12.5]
+let density = [0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374,
+               0.614, 0.609, 1.019, 1.001, 1.334, 1.364, 1.73, 1.71,
+               0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364, 0.36,
+               0.62, 0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732,
+               0.054, 0.054, 0.152, 0.148, 0.226, 0.222, 0.392, 0.383,
+               0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724]
+var doses: seq[float]
+var curve: seq[int]  # which curve each observation belongs to
+for c in 0 .. 2:
+  for d in conc:
+    doses.add [d, d]
+    curve.add [c, c]
+
+let parallel = fitLL4Multi(doses, density, curve, shared = {Bottom, Top, Hill})
+let separate = fitLL4Multi(doses, density, curve)
+echo parallel.summary
+echo ""
+let t = fTest(parallel, separate)
+echo &"parallel vs separate curves: F = {t.f:.3f} on {t.df1} and {t.df2} df, p = {t.p:.3f}"
+let rp = parallel.relativePotency(0, 2)
+echo &"EC50 of run 1 / run 8: {rp.ratio:.3f} (95% CI {rp.ci.lower:.3f}–{rp.ci.upper:.3f})"
+```
+
+```
+4PL joint fit to 48 observations in 3 curves; shared: Bottom, Top, Hill
+
+                Estimate   Std.Error     Lower 95%     Upper 95%
+Bottom         0.0121531  0.00957145   -0.00716285     0.0314691
+Top              2.29602   0.0542247       2.18659       2.40545
+LogEC50[0]      0.626875   0.0225288      0.581410      0.672340
+LogEC50[1]      0.617693   0.0225725      0.572140      0.663246
+LogEC50[2]      0.595804   0.0226798      0.550034      0.641573
+Hill             1.00224   0.0303847      0.940919       1.06356
+EC50[0]          4.23521                   3.81426       4.70262
+EC50[1]          4.14661                   3.73370       4.60518
+EC50[2]          3.94279                   3.54841       4.38100
+
+Residual standard error: 0.0206314 on 42 degrees of freedom
+R²: 0.998922   AIC: -228.762   BIC: -215.663
+Stopped after 6 iterations: relative change in SSR below ftol
+
+parallel vs separate curves: F = 2.131 on 6 and 36 df, p = 0.074
+EC50 of run 1 / run 8: 1.074 (95% CI 1.033–1.117)
+```
+
+Here the F test finds no evidence against parallel curves (p = 0.074), so the
+shared-slope model is a fair basis for the potency ratio.
+
+- **`fit.curves[c]`** is curve c as an ordinary `DrcFit`, so `ec50`, `ecxCI`,
+  `predict` and the bands work on it. Its covariance is curve c's block of the
+  joint covariance, and its `df` and `sigma` are the joint fit's (σ is pooled
+  over all curves).
+- **`relativePotency(a, b, pct = 50)`** is ECx of curve a over ECx of curve b.
+  Its interval comes from the delta method on log10 of the ratio, using the
+  joint covariance, so it is asymmetric. R drc's `EDcomp` uses the ratio scale
+  by default, which gives a symmetric interval.
+- **`fTest(reduced, full)`** compares nested fits to the same data, as R's
+  `anova`: for example parallel against separate curves, a 4PL against a 5PL,
+  or one pooled curve (all curve ids 0) against several.
+- **`fixed`** parameters are held at one value for every curve.
+- Joint fits use least squares only, without the Nelder–Mead fallback.
+  Starting values come from fitting each curve on its own.
+
 ### Checking fit quality
 
 Problems are reported in `fit.warnings` rather than raised:
@@ -365,12 +444,13 @@ For the parameter covariance, build JᵀWJ at the solution with
 | File | Contents |
 |---|---|
 | `src/drc.nim` | public API: `fitLL3`/`fitLL4`/`fitLL5`, `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `predict`, `confidenceBand`, `predictionBand` |
+| `src/drc/multi.nim` | joint fits of several curves: `fitLL4Multi` etc., `MultiFit`, `relativePotency`, `fTest` (included by `drc.nim`) |
 | `src/drc/models.nim` | the 5PL model with its analytic gradient, and initial guesses |
 | `src/drc/lm.nim` | Levenberg–Marquardt for weighted least squares |
 | `src/drc/neldermead.nim` | Nelder–Mead simplex minimisation |
 | `src/drc/robust.nim` | Huber and Tukey loss functions (ψ, weights, ψ′) and the MAD scale |
-| `src/drc/stats.nim` | incomplete beta, Student's t CDF and quantile, covariance, log-likelihood |
-| `src/drc/linalg.nim` | Cholesky solve and inverse for small fixed-size matrices |
+| `src/drc/stats.nim` | incomplete beta, Student's t CDF and quantile, F upper tail, covariance, log-likelihood |
+| `src/drc/linalg.nim` | Cholesky solve and inverse, for fixed-size arrays or runtime-sized seqs |
 
 ## Validation
 
@@ -384,7 +464,14 @@ The tests compare against reference values from R:
 - **Robust fits:** `robustbase::nlrob` coefficients, scale and weights for
   Huber and Tukey fits of data with outliers. Standard errors are checked
   against `MASS::rlm`'s covariance formula, computed independently in R.
-- **Distributions:** `qt`, `pt` and `pbeta`.
+- **Joint fits:** `nls` fits with indexed parameters (e.g.
+  `density ~ b + (t-b)/(1+10^((l[c]-x)*h))`) of R's DNase data and of
+  simulated data: parallel and separate curves, weights and zero weights,
+  unequal curve lengths, zero-dose controls, 3PL and 5PL, compared on
+  coefficients, standard errors, the full covariance matrix, SSR and AIC.
+  F tests match `anova`; relative potency intervals match a delta-method
+  calculation in R with ECx found by root finding.
+- **Distributions:** `qt`, `pt`, `pbeta` and `pf`.
 - **Cross-checks:** the parameter estimates also agree with SciPy's `curve_fit`
   and with the LL.4 and ED10/50/90 estimates published for `drc`.
 - **Robustness:** a sparse dataset where a single start gets stuck in a local

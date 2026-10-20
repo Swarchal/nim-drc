@@ -184,7 +184,7 @@ proc predictionBand*(fit: DrcFit; doses: openArray[float]; level = 0.95; weight 
 proc predictionBand*(fit: DrcFit; dose: float; level = 0.95; weight = 1.0): Band =
   fit.bandAt(dose, fit.tQuantile(level), fit.residualVariance(weight))
 
-func better(a, b: LMResult[drcParamCount]): bool =
+func better[R](a, b: R): bool =
   ## A lower SSR wins, and any finite SSR beats NaN. Within rounding of each
   ## other, a converged fit beats an unconverged one; otherwise the earlier
   ## (default) start keeps its place.
@@ -280,6 +280,30 @@ proc irls(x, y, w: openArray[float]; start: LMResult[drcParamCount];
       result.converged = true
       return
 
+proc checkObservation(dose, response, weight: float) =
+  if not (dose >= 0.0 and dose < Inf):
+    raise newException(ValueError, "dose must be finite and non-negative, got " & $dose)
+  if not response.isFinite:
+    raise newException(ValueError, "response must be finite, got " & $response)
+  if not (weight >= 0.0 and weight < Inf):
+    raise newException(ValueError, "weight must be finite and non-negative, got " & $weight)
+
+proc resolveFixed(model: Model; fixed: openArray[(DrcParam, float)]):
+                  tuple[values: ParamVec; params: set[DrcParam]] =
+  ## The fixed parameters and their values, including Asymmetry = 1 for 3PL/4PL.
+  for (param, value) in fixed:
+    if param == Asymmetry and model != LL5:
+      raise newException(ValueError, "Asymmetry can only be fixed in a 5PL fit")
+    if not value.isFinite:
+      raise newException(ValueError, "fixed " & $param & " must be finite, got " & $value)
+    result.values[ord(param)] = value
+    result.params.incl param
+  if model != LL5:
+    result.values[ord(Asymmetry)] = 1.0
+    result.params.incl Asymmetry
+  if Asymmetry in result.params and not (result.values[ord(Asymmetry)] > 0.0):
+    raise newException(ValueError, "Asymmetry must be positive")
+
 proc fitCurve(model: Model; doses, responses, weights: openArray[float];
               fixed: openArray[(DrcParam, float)]; opts: FitOptions): DrcFit =
   result.model = model
@@ -295,14 +319,9 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
     lo = Inf
     hi = NegInf
   for i in 0 ..< doses.len:
-    if not (doses[i] >= 0.0 and doses[i] < Inf):
-      raise newException(ValueError, "dose must be finite and non-negative, got " & $doses[i])
-    if not responses[i].isFinite:
-      raise newException(ValueError, "response must be finite, got " & $responses[i])
     x[i] = log10(doses[i])
     w[i] = if weights.len == 0: 1.0 else: weights[i]
-    if not (w[i] >= 0.0 and w[i] < Inf):
-      raise newException(ValueError, "weight must be finite and non-negative, got " & $w[i])
+    checkObservation(doses[i], responses[i], w[i])
     if w[i] > 0.0:
       inc result.n
       guessX.add x[i]
@@ -315,23 +334,10 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
         hi = max(hi, x[i])
   result.logDoseRange = if lo <= hi: (lo, hi) else: (NaN, NaN)
 
-  var
-    fixedValues: ParamVec
-    free: array[drcParamCount, bool] = [true, true, true, true, true]
-  for (param, value) in fixed:
-    if param == Asymmetry and model != LL5:
-      raise newException(ValueError, "Asymmetry can only be fixed in a 5PL fit")
-    if not value.isFinite:
-      raise newException(ValueError, "fixed " & $param & " must be finite, got " & $value)
-    fixedValues[ord(param)] = value
-    free[ord(param)] = false
-    result.fixed.incl param
-  if model != LL5:
-    fixedValues[ord(Asymmetry)] = 1.0
-    free[ord(Asymmetry)] = false
-    result.fixed.incl Asymmetry
-  if not (fixedValues[ord(Asymmetry)] > 0.0) and Asymmetry in result.fixed:
-    raise newException(ValueError, "Asymmetry must be positive")
+  let (fixedValues, fixedParams) = resolveFixed(model, fixed)
+  result.fixed = fixedParams
+  var free: array[drcParamCount, bool]
+  for param in DrcParam: free[ord(param)] = param notin fixedParams
 
   result.loss = opts.loss
   if opts.loss != Squared:
@@ -526,3 +532,5 @@ proc summary*(fit: DrcFit; level = 0.95): string =
     result.add &"Stopped after {fit.iterations} iterations: {fit.status}"
   for warning in fit.warnings:
     result.add &"\nWarning: {warning}"
+
+include drc/multi
