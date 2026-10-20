@@ -6,9 +6,9 @@
 ##   echo fit.summary
 
 import std/[math, strformat]
-import drc/[linalg, lm, models, neldermead, stats]
+import drc/[linalg, lm, models, neldermead, robust, stats]
 
-export lm, models, neldermead, stats
+export lm, models, neldermead, robust, stats
 
 type
   Model* = enum
@@ -21,14 +21,22 @@ type
     fwSingular = "parameters are not identifiable (JᵀWJ is singular); standard errors unavailable"
     fwNoResidualDf = "no residual degrees of freedom; standard errors unavailable"
     fwEc50OutsideRange = "EC50 lies outside the tested dose range"
+    fwRobustNotConverged = "the robust reweighting did not converge"
 
   FitOptions* = object
     lm*: LMOptions = LMOptions()
     nelderMead*: NMOptions = NMOptions()
     multiStart*: bool = true  ## also start from shifted LogEC50 and scaled Hill, keeping the best fit
     fallback*: bool = true    ## run Nelder–Mead when Levenberg–Marquardt does not converge
+    loss*: Loss = Squared     ## Huber or Tukey for a robust fit that downweights outliers
+    tuning*: float = NaN      ## the loss's tuning constant in units of the robust scale;
+                              ## NaN uses the 95%-efficient default (1.345 Huber, 4.685 Tukey)
+    irlsMaxIter*: int = 100   ## reweighting rounds for a robust fit
+    irlsTol*: float = 1e-10   ## stop reweighting when the residuals change by less than this (relative)
 
   ConfInt* = tuple[lower, upper: float]
+
+  Band* = tuple[fit, lower, upper: float]  ## a fitted response and its interval
 
   DrcFit* = object
     model*: Model
@@ -39,11 +47,16 @@ type
     n*: int              ## observations with non-zero weight
     df*: int             ## residual degrees of freedom: n − number of free parameters
     ssr*: float          ## weighted residual sum of squares
-    sigma*: float        ## residual standard error, sqrt(ssr / df)
+    sigma*: float        ## residual standard error, sqrt(ssr / df); for a robust fit, the
+                         ## robust (MAD) scale of the residuals
     rSquared*: float     ## 1 − SSR / (weighted) total sum of squares
-    logLik*: float       ## Gaussian log-likelihood, as R's logLik.nls
-    aic*: float          ## AIC, counting σ as a parameter (as R and drc)
-    bic*: float
+    logLik*: float       ## Gaussian log-likelihood, as R's logLik.nls (NaN for robust fits)
+    aic*: float          ## AIC, counting σ as a parameter, as R and drc (NaN for robust fits)
+    bic*: float          ## (NaN for robust fits)
+    loss*: Loss
+    tuning*: float              ## the loss's tuning constant (robust fits)
+    robustWeights*: seq[float]  ## final ψ(u)/u per observation (robust fits; 0 where the
+                                ## user's weight is 0); 1 means not downweighted
     logDoseRange*: tuple[lower, upper: float]  ## smallest and largest non-zero log10 dose
     converged*: bool
     usedFallback*: bool  ## Levenberg–Marquardt failed and Nelder–Mead was run
@@ -128,6 +141,41 @@ proc ecxCI*(fit: DrcFit; pct: float; level = 0.95): ConfInt =
 
 proc ec50CI*(fit: DrcFit; level = 0.95): ConfInt = fit.ecxCI(50.0, level)
 
+proc bandAt(fit: DrcFit; dose, tq, extraVariance: float): Band =
+  ## The fitted response at `dose` ± tq·sqrt(Var(f̂) + extraVariance), with
+  ## Var(f̂) = gᵀ·cov·g by the delta method.
+  if not (dose >= 0.0 and dose < Inf):
+    raise newException(ValueError, "dose must be finite and non-negative, got " & $dose)
+  var grad: ParamVec
+  let value = ll5(log10(dose), fit.params.toVec, grad)
+  var variance = extraVariance
+  for i in DrcParam:
+    for j in DrcParam:
+      variance += grad[ord(i)] * fit.cov[i][j] * grad[ord(j)]
+  let half = tq * sqrt(variance)
+  (value, value - half, value + half)
+
+proc confidenceBand*(fit: DrcFit; doses: openArray[float]; level = 0.95): seq[Band] =
+  ## Pointwise confidence band for the fitted curve: where the true mean
+  ## response lies at each dose.
+  let tq = fit.tQuantile(level)
+  for dose in doses: result.add fit.bandAt(dose, tq, 0.0)
+
+proc confidenceBand*(fit: DrcFit; dose: float; level = 0.95): Band =
+  fit.confidenceBand([dose], level)[0]
+
+proc predictionBand*(fit: DrcFit; doses: openArray[float]; level = 0.95; weight = 1.0): seq[Band] =
+  ## Pointwise prediction band: where a new observation at each dose is
+  ## expected to fall. It adds the residual variance σ²/`weight` to the
+  ## confidence band, with `weight` on the same relative scale as the fit's.
+  if not (weight > 0.0 and weight < Inf):
+    raise newException(ValueError, "weight must be finite and positive, got " & $weight)
+  let tq = fit.tQuantile(level)
+  for dose in doses: result.add fit.bandAt(dose, tq, fit.sigma ^ 2 / weight)
+
+proc predictionBand*(fit: DrcFit; dose: float; level = 0.95; weight = 1.0): Band =
+  fit.predictionBand([dose], level, weight)[0]
+
 func better(a, b: LMResult[drcParamCount]): bool =
   ## A lower SSR wins, and any finite SSR beats NaN. Within rounding of each
   ## other, a converged fit beats an unconverged one; otherwise the earlier
@@ -171,6 +219,53 @@ proc searchLM(x, y, w: openArray[float]; p0: ParamVec; free: array[drcParamCount
       p[ord(Asymmetry)] = a
       let r = levenbergMarquardt(ll5, x, y, w, p, free, opts.lm)
       if r.better(result): result = r
+
+proc standardisedResiduals(x, y, w: openArray[float]; p: ParamVec): seq[float] =
+  ## √wᵢ·(yᵢ − f(xᵢ)), and 0 for observations with zero weight.
+  result = newSeq[float](x.len)
+  var grad: ParamVec
+  for i in 0 ..< x.len:
+    if w[i] > 0.0: result[i] = sqrt(w[i]) * (y[i] - ll5(x[i], p, grad))
+
+type IrlsResult = object
+  fit: LMResult[drcParamCount]
+  scale: float
+  residuals: seq[float]  ## standardised, at fit.params
+  converged: bool
+
+proc irls(x, y, w: openArray[float]; start: LMResult[drcParamCount];
+          free: array[drcParamCount, bool]; loss: Loss; c: float; opts: FitOptions): IrlsResult =
+  ## M-estimation by iteratively reweighted least squares, as R's
+  ## robustbase::nlrob. Each round takes the robust scale s of the current
+  ## residuals, weights observation i by wᵢ·ψ(uᵢ)/uᵢ with uᵢ = rᵢ/s, and refits.
+  ## It stops when the residuals change by less than `opts.irlsTol` (relative).
+  result.fit = start
+  result.residuals = standardisedResiduals(x, y, w, start.params)
+  var
+    used: seq[float]
+    robustW = newSeq[float](x.len)
+  for _ in 1 .. opts.irlsMaxIter:
+    used.setLen 0
+    for i in 0 ..< x.len:
+      if w[i] > 0.0: used.add result.residuals[i]
+    result.scale = madScale(used)
+    if not (result.scale > 0.0):
+      return  # most residuals are exactly zero, so there is no scale to weight by
+    for i in 0 ..< x.len:
+      robustW[i] = w[i] * psiWeight(loss, result.residuals[i] / result.scale, c)
+    # Copy the start: the call writes its result straight into result.fit, and
+    # Nim passes the start array by reference, so it would read zeros.
+    let current = result.fit.params
+    result.fit = levenbergMarquardt(ll5, x, y, robustW, current, free, opts.lm)
+    let residuals = standardisedResiduals(x, y, w, result.fit.params)
+    var change, size = 0.0
+    for i in 0 ..< x.len:
+      change += (residuals[i] - result.residuals[i]) ^ 2
+      size += result.residuals[i] ^ 2
+    result.residuals = residuals
+    if sqrt(change / max(size, 1e-20)) <= opts.irlsTol:
+      result.converged = true
+      return
 
 proc fitCurve(model: Model; doses, responses, weights: openArray[float];
               fixed: openArray[(DrcParam, float)]; opts: FitOptions): DrcFit =
@@ -225,6 +320,12 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
   if not (fixedValues[ord(Asymmetry)] > 0.0) and Asymmetry in result.fixed:
     raise newException(ValueError, "Asymmetry must be positive")
 
+  result.loss = opts.loss
+  if opts.loss != Squared:
+    result.tuning = if opts.tuning.isNaN: defaultTuning(opts.loss) else: opts.tuning
+    if not (result.tuning > 0.0 and result.tuning < Inf):
+      raise newException(ValueError, "tuning must be finite and positive, got " & $opts.tuning)
+
   let nFree = drcParamCount - card(result.fixed)
   if result.n < max(nFree, 1):
     raise newException(ValueError, "need at least " & $max(nFree, 1) & " observations with " &
@@ -245,8 +346,25 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
     result.usedFallback = true
     result.converged = best.status.converged or nm.converged
 
+  # A robust fit reweights from the least-squares fit.
+  var robustFit: IrlsResult
+  if result.loss != Squared:
+    var start = best
+    if result.loss == Tukey:
+      # Tukey's redescending ψ can stop in a local minimum, so start from Huber.
+      start = irls(x, responses, w, best, free, Huber, defaultTuning(Huber), opts).fit
+    robustFit = irls(x, responses, w, start, free, result.loss, result.tuning, opts)
+    best = robustFit.fit
+    result.converged = best.status.converged
+    if not robustFit.converged: result.warnings.incl fwRobustNotConverged
+    result.robustWeights = newSeq[float](x.len)
+    for i in 0 ..< x.len:
+      if w[i] > 0.0:
+        result.robustWeights[i] =
+          psiWeight(result.loss, robustFit.residuals[i] / robustFit.scale, result.tuning)
+
   result.params = best.params.toParams
-  result.ssr = best.ssr
+  result.ssr = weightedSsr(ll5, x, responses, w, best.params)
   result.iterations = best.iterations
   result.status = best.status
   result.df = result.n - nFree
@@ -257,8 +375,32 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
   if not (logEC50 >= result.logDoseRange.lower and logEC50 <= result.logDoseRange.upper):
     result.warnings.incl fwEc50OutsideRange
 
-  # Uncertainty: cov = σ² (JᵀWJ)⁻¹ over the free parameters.
-  result.sigma = if result.df > 0: sqrt(result.ssr / float(result.df)) else: NaN
+  # Uncertainty: cov = varianceScale · (JᵀWJ)⁻¹ over the free parameters, with
+  # varianceScale = σ² for least squares.
+  var varianceScale = NaN
+  if result.loss == Squared:
+    result.sigma = if result.df > 0: sqrt(result.ssr / float(result.df)) else: NaN
+    varianceScale = result.sigma ^ 2
+  else:
+    # Huber's correction, as MASS::rlm: κ²·S / mean(ψ')², where
+    # S = s²·Σψ(uᵢ)²/(n − p) and κ = 1 + p·var(ψ')/(n·mean(ψ')²).
+    let s = robustFit.scale
+    result.sigma = s
+    var sumPsi2, sumD, sumD2 = 0.0
+    for i in 0 ..< x.len:
+      if w[i] > 0.0:
+        let u = robustFit.residuals[i] / s
+        sumPsi2 += psi(result.loss, u, result.tuning) ^ 2
+        let d = psiDerivative(result.loss, u, result.tuning)
+        sumD += d
+        sumD2 += d * d
+    let
+      n = float(result.n)
+      meanD = sumD / n
+      varD = (sumD2 - n * meanD * meanD) / (n - 1.0)
+      kappa = 1.0 + float(nFree) * varD / (n * meanD * meanD)
+    if result.df > 0 and meanD > 0.0:
+      varianceScale = (kappa / meanD) ^ 2 * s * s * sumPsi2 / float(result.df)
   var
     jtwj, unscaled: array[drcParamCount, array[drcParamCount, float]]
     gradient: ParamVec
@@ -270,7 +412,7 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
       # Fixed entries are exactly 0; a NaN σ or (JᵀWJ)⁻¹ carries through to the rest.
       result.cov[i][j] =
         if i in result.fixed or j in result.fixed: 0.0
-        else: result.sigma ^ 2 * unscaled[ord(i)][ord(j)]
+        else: varianceScale * unscaled[ord(i)][ord(j)]
   for param in DrcParam:
     result.se[param] = sqrt(result.cov[param][param])
 
@@ -280,10 +422,14 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
   for i in 0 ..< responses.len:
     sst += w[i] * (responses[i] - meanY) ^ 2
   result.rSquared = 1.0 - result.ssr / sst
-  result.logLik = gaussianLogLik(result.ssr, result.n, sumLogW)
-  let k = float(nFree + 1)  # free parameters plus σ
-  result.aic = -2.0 * result.logLik + 2.0 * k
-  result.bic = -2.0 * result.logLik + ln(float(result.n)) * k
+  if result.loss == Squared:
+    result.logLik = gaussianLogLik(result.ssr, result.n, sumLogW)
+    let k = float(nFree + 1)  # free parameters plus σ
+    result.aic = -2.0 * result.logLik + 2.0 * k
+    result.bic = -2.0 * result.logLik + ln(float(result.n)) * k
+  else:
+    # A robust fit does not maximise the Gaussian likelihood.
+    (result.logLik, result.aic, result.bic) = (NaN, NaN, NaN)
 
 proc fitLL4*(doses, responses: openArray[float];
              weights: openArray[float] = [];
@@ -316,7 +462,10 @@ proc summary*(fit: DrcFit; level = 0.95): string =
   let
     pct = &"{100.0 * level:g}%"
     tq = fit.tQuantile(level)
-  result.add &"{fit.model} fit to {fit.n} observations\n\n"
+  result.add &"{fit.model} fit to {fit.n} observations"
+  if fit.loss != Squared:
+    result.add &", robust ({fit.loss}, tuning {fit.tuning:g})"
+  result.add "\n\n"
   result.add &"""{"":<10}{"Estimate":>12}{"Std.Error":>12}{"Lower " & pct:>14}{"Upper " & pct:>14}""" & "\n"
   for param in DrcParam:
     if param == Asymmetry and fit.model != LL5:
@@ -328,8 +477,19 @@ proc summary*(fit: DrcFit; level = 0.95): string =
       result.add &"{$param:<10}{fit.params[param]:>12.6g}{fit.se[param]:>12.6g}{ci.lower:>14.6g}{ci.upper:>14.6g}\n"
   let ci = fit.ecxInterval(50.0, tq)
   result.add &"{\"EC50\":<10}{fit.ec50:>12.6g}{\"\":>12}{ci.lower:>14.6g}{ci.upper:>14.6g}\n\n"
-  result.add &"Residual standard error: {fit.sigma:.6g} on {fit.df} degrees of freedom\n"
-  result.add &"R²: {fit.rSquared:.6g}   AIC: {fit.aic:.6g}   BIC: {fit.bic:.6g}\n"
+  if fit.loss == Squared:
+    result.add &"Residual standard error: {fit.sigma:.6g} on {fit.df} degrees of freedom\n"
+    result.add &"R²: {fit.rSquared:.6g}   AIC: {fit.aic:.6g}   BIC: {fit.bic:.6g}\n"
+  else:
+    var strong, rejected = 0
+    for rw in fit.robustWeights:
+      if rw == 0.0: inc rejected
+      elif rw < 0.5: inc strong
+    # Observations the user excluded (weight 0) are not counted as rejected.
+    rejected -= fit.robustWeights.len - fit.n
+    result.add &"Robust residual scale (MAD): {fit.sigma:.6g} on {fit.df} degrees of freedom\n"
+    result.add &"Robust weight below 0.5: {strong} observations; 0 (rejected): {rejected}\n"
+    result.add &"R²: {fit.rSquared:.6g}\n"
   if fit.usedFallback:
     let outcome = if fit.converged: "converged" else: "did not converge"
     result.add "Levenberg–Marquardt did not converge; the Nelder–Mead fallback " & outcome &

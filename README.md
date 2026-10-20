@@ -5,9 +5,11 @@ Dose-response curve fitting for Nim, with no dependencies beyond the standard li
 - Three-, four- and five-parameter logistic fits (3PL, 4PL / Hill, 5PL)
 - Levenberg–Marquardt with multi-start, and a Nelder–Mead fallback
 - Zero-dose controls, fixed parameters and weighted fits
+- Robust fits (Huber, Tukey bisquare) that downweight or reject outliers
 - Standard errors, t-based confidence intervals, R², AIC/BIC
 - EC50 and any ECx (EC10, EC90, …) with confidence intervals
-- Results validated against R (`nls`, and the published `drc` estimates for its `ryegrass` dataset)
+- Confidence and prediction bands for the fitted curve
+- Results validated against R (`nls`, `robustbase::nlrob`, and the published `drc` estimates for its `ryegrass` dataset)
 
 ## Installation
 
@@ -174,6 +176,37 @@ AIC free Hill: 23.53, Hill = -1: 47.86
 the high-dose plateau. ECx intervals are computed on the log-dose scale and
 back-transformed, so they are asymmetric in dose.
 
+### Confidence and prediction bands
+
+Continuing the example above:
+
+```nim
+let grid = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
+let conf = fit.confidenceBand(grid)
+let pred = fit.predictionBand(grid)
+echo "dose   fitted   95% confidence    95% prediction"
+for i, dose in grid:
+  echo &"{dose:>4g} {conf[i].fit:>8.3f}   [{conf[i].lower:.3f}, {conf[i].upper:.3f}]   [{pred[i].lower:6.3f}, {pred[i].upper:.3f}]"
+```
+
+```
+dose   fitted   95% confidence    95% prediction
+ 0.5    7.774   [7.225, 8.324]   [ 6.603, 8.946]
+   1    7.657   [7.190, 8.123]   [ 6.522, 8.791]
+   2    6.342   [5.575, 7.109]   [ 5.054, 7.629]
+   4    2.161   [1.472, 2.850]   [ 0.919, 3.404]
+   8    0.684   [0.281, 1.088]   [-0.426, 1.794]
+  16    0.548   [0.099, 0.996]   [-0.579, 1.675]
+```
+
+- **Confidence band:** where the true mean response lies at each dose. It uses
+  the delta method with the parameter covariance.
+- **Prediction band:** where a new observation is expected to fall. It adds
+  the residual variance σ² (or σ²/`weight`, for a new observation with that
+  relative weight).
+- Both take a single dose or a sequence (as here, for plotting), and return
+  `(fit, lower, upper)` tuples.
+
 ### Weights
 
 Weights are relative, as in R's `nls`: observation i is taken to have error
@@ -184,6 +217,67 @@ observation.
 let fit = fitLL4(doses, resp, weights = [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 1.0,
                                          1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
 ```
+
+### Robust fitting (outliers)
+
+Least squares lets a few bad wells drag the curve. A robust fit downweights
+large residuals, either gently (`Huber`) or rejecting them outright beyond a
+cut-off (`Tukey` bisquare):
+
+```nim
+import std/strformat
+import drc
+
+# % activity of an inhibitor, triplicates, with three wells gone wrong
+let doses = [1e-9, 1e-9, 1e-9, 3.16e-9, 3.16e-9, 3.16e-9, 1e-8, 1e-8, 1e-8,
+             3.16e-8, 3.16e-8, 3.16e-8, 1e-7, 1e-7, 1e-7, 3.16e-7, 3.16e-7, 3.16e-7,
+             1e-6, 1e-6, 1e-6, 3.16e-6, 3.16e-6, 3.16e-6, 1e-5, 1e-5, 1e-5,
+             3.16e-5, 3.16e-5, 3.16e-5, 1e-4, 1e-4, 1e-4]
+let activity = [104.03, 90.24, 99.16, 95.92, 136.26, 96.97, 90.44, 95.81, 93.91,
+                102.27, 92.98, 91.24, 77.88, 76.72, 75.56, 48.83, 16.45, 49.28,
+                24.15, 20.67, 21.35, 12.34, 9.33, 6.18, 2.95, 35.12, 9.3,
+                1.57, 1.65, 5.39, -0.56, 1.22, 4.74]
+
+for loss in [Squared, Huber, Tukey]:
+  let fit = fitLL4(doses, activity, opts = FitOptions(loss: loss))
+  let ci = fit.ec50CI
+  echo &"{$loss:<15} IC50 {fit.ec50 * 1e9:5.1f} nM  (95% CI {ci.lower * 1e9:5.1f}–{ci.upper * 1e9:5.1f})"
+
+let tukey = fitLL4(doses, activity, opts = FitOptions(loss: Tukey))
+for i, w in tukey.robustWeights:
+  if w < 0.5: echo &"well {i}: dose {doses[i]:g}, activity {activity[i]}, weight {w:.2f}"
+```
+
+```
+least squares   IC50 206.8 nM  (95% CI 137.9–310.2)
+Huber           IC50 290.0 nM  (95% CI 250.1–336.2)
+Tukey bisquare  IC50 310.4 nM  (95% CI 274.6–350.8)
+well 0: dose 1e-09, activity 104.03, weight 0.32
+well 1: dose 1e-09, activity 90.24, weight 0.35
+well 4: dose 3.16e-09, activity 136.26, weight 0.00
+well 9: dose 3.16e-08, activity 102.27, weight 0.00
+well 16: dose 3.16e-07, activity 16.45, weight 0.00
+well 25: dose 1e-05, activity 35.12, weight 0.00
+```
+
+The data were simulated with a true IC50 of 316 nM, and wells 4, 16 and 25 had
+gross errors added. Both robust fits land much closer than least squares, with
+narrower intervals. Tukey also rejected well 9, a genuine but unusually high
+point. Rejection is automatic, so check `robustWeights` before trusting it.
+
+How a robust fit works:
+- **The method** is M-estimation by iteratively reweighted least squares, as
+  R's `robustbase::nlrob`. Residuals are scaled by their robust spread
+  (median |r| / 0.6745), and each round reweights and refits. Tukey starts
+  from the Huber fit, because its loss has local minima.
+- **`tuning`** in `FitOptions` sets the cut-off in units of that spread. The
+  defaults (1.345 Huber, 4.685 Tukey) lose only 5% efficiency when there are
+  no outliers.
+- **Standard errors** use Huber's covariance correction (as `MASS::rlm`), and
+  `fit.sigma` is the robust scale. `logLik`, `aic` and `bic` are NaN, since a
+  robust fit is not a likelihood fit.
+- **`fit.robustWeights`** holds each observation's final weight: 1 means not
+  downweighted, 0 means rejected.
 
 ### Checking fit quality
 
@@ -205,6 +299,7 @@ warning: EC50 lies outside the tested dose range
 | `fwEc50OutsideRange` | the EC50 is extrapolated beyond the tested doses |
 | `fwSingular` | the parameters are not identifiable (e.g. a flat response); standard errors are NaN |
 | `fwNoResidualDf` | as many free parameters as observations; standard errors are NaN |
+| `fwRobustNotConverged` | the robust reweighting hit `irlsMaxIter` without settling |
 
 Invalid input raises `ValueError`. This covers negative or non-finite doses,
 non-finite responses, mismatched lengths, too few observations, a non-positive
@@ -266,10 +361,11 @@ For the parameter covariance, build JᵀWJ at the solution with
 
 | File | Contents |
 |---|---|
-| `src/drc.nim` | public API: `fitLL3`/`fitLL4`/`fitLL5`, `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `predict` |
+| `src/drc.nim` | public API: `fitLL3`/`fitLL4`/`fitLL5`, `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `predict`, `confidenceBand`, `predictionBand` |
 | `src/drc/models.nim` | the 5PL model with its analytic gradient, and initial guesses |
 | `src/drc/lm.nim` | Levenberg–Marquardt for weighted least squares |
 | `src/drc/neldermead.nim` | Nelder–Mead simplex minimisation |
+| `src/drc/robust.nim` | Huber and Tukey loss functions (ψ, weights, ψ′) and the MAD scale |
 | `src/drc/stats.nim` | incomplete beta, Student's t CDF and quantile, covariance, log-likelihood |
 | `src/drc/linalg.nim` | Cholesky solve and inverse for small fixed-size matrices |
 
@@ -280,6 +376,11 @@ The tests compare against reference values from R:
   weighted, and with Bottom fixed), compared on parameters, standard errors,
   σ, R², log-likelihood, AIC, BIC and confidence intervals; and a 5PL fit of
   synthetic asymmetric data, including ECx intervals.
+- **Bands:** delta-method confidence and prediction bands, computed in R with
+  finite-difference gradients, for 4PL and 5PL fits.
+- **Robust fits:** `robustbase::nlrob` coefficients, scale and weights for
+  Huber and Tukey fits of data with outliers. Standard errors are checked
+  against `MASS::rlm`'s covariance formula, computed independently in R.
 - **Distributions:** `qt`, `pt` and `pbeta`.
 - **Cross-checks:** the parameter estimates also agree with SciPy's `curve_fit`
   and with the LL.4 and ED10/50/90 estimates published for `drc`.
