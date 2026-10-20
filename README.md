@@ -269,7 +269,10 @@ How a robust fit works:
 - **The method** is M-estimation by iteratively reweighted least squares, as
   R's `robustbase::nlrob`. Residuals are scaled by their robust spread
   (median |r| / 0.6745), and each round reweights and refits. Tukey starts
-  from the Huber fit, because its loss has local minima.
+  from the Huber fit, because its loss has local minima. The scale has a floor
+  of 1e-6 times the spread of the responses, so data that the curve fits
+  exactly at most points don't get a scale of rounding error, which would
+  reject every other point.
 - **`tuning`** in `FitOptions` sets the cut-off in units of that spread. The
   defaults (1.345 Huber, 4.685 Tukey) lose only 5% efficiency when there are
   no outliers.
@@ -295,11 +298,11 @@ warning: EC50 lies outside the tested dose range
 
 | Warning | Meaning |
 |---|---|
-| `fwNotConverged` | neither Levenberg–Marquardt nor the Nelder–Mead fallback converged |
+| `fwNotConverged` | neither Levenberg–Marquardt nor the Nelder–Mead fallback converged (for a robust fit: the last refit did not) |
 | `fwEc50OutsideRange` | the EC50 is extrapolated beyond the tested doses |
 | `fwSingular` | the parameters are not identifiable (e.g. a flat response); standard errors are NaN |
 | `fwNoResidualDf` | as many free parameters as observations; standard errors are NaN |
-| `fwRobustNotConverged` | the robust reweighting hit `irlsMaxIter` without settling |
+| `fwRobustNotConverged` | the robust reweighting hit `irlsMaxIter` without settling, or a refit failed |
 
 Invalid input raises `ValueError`. This covers negative or non-finite doses,
 non-finite responses, mismatched lengths, too few observations, a non-positive

@@ -17,14 +17,6 @@ func defaultTuning*(loss: Loss): float =
   of Huber: 1.345
   of Tukey: 4.685
 
-func psi*(loss: Loss; u, c: float): float =
-  ## ψ(u), the derivative of the loss.
-  case loss
-  of Squared: u
-  of Huber: clamp(u, -c, c)
-  of Tukey:
-    if abs(u) < c: u * (1.0 - (u / c) * (u / c)) * (1.0 - (u / c) * (u / c)) else: 0.0
-
 func psiWeight*(loss: Loss; u, c: float): float =
   ## The IRLS weight ψ(u)/u (1 at u = 0).
   case loss
@@ -32,6 +24,14 @@ func psiWeight*(loss: Loss; u, c: float): float =
   of Huber: (if abs(u) <= c: 1.0 else: c / abs(u))
   of Tukey:
     if abs(u) < c: (1.0 - (u / c) * (u / c)) * (1.0 - (u / c) * (u / c)) else: 0.0
+
+func psi*(loss: Loss; u, c: float): float =
+  ## ψ(u), the derivative of the loss. Written out rather than as u·ψ(u)/u,
+  ## which would give NaN at u = ±Inf.
+  case loss
+  of Squared: u
+  of Huber: clamp(u, -c, c)
+  of Tukey: (if abs(u) < c: u * psiWeight(Tukey, u, c) else: 0.0)
 
 func psiDerivative*(loss: Loss; u, c: float): float =
   ## ψ'(u).

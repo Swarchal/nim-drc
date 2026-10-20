@@ -6,6 +6,7 @@
 ##   echo fit.summary
 
 import std/[math, strformat]
+from std/stats import RunningStat, push, mean, varianceS  # drc/stats is a different module
 import drc/[linalg, lm, models, neldermead, robust, stats]
 
 export lm, models, neldermead, robust, stats
@@ -58,8 +59,10 @@ type
     robustWeights*: seq[float]  ## final ψ(u)/u per observation (robust fits; 0 where the
                                 ## user's weight is 0); 1 means not downweighted
     logDoseRange*: tuple[lower, upper: float]  ## smallest and largest non-zero log10 dose
-    converged*: bool
+    converged*: bool     ## false if the optimiser or, for a robust fit, the reweighting
+                         ## did not converge (see `warnings`)
     usedFallback*: bool  ## Levenberg–Marquardt failed and Nelder–Mead was run
+    fallbackConverged*: bool  ## with `usedFallback`: Nelder–Mead or its polishing run converged
     iterations*: int     ## iterations of the final Levenberg–Marquardt run
     status*: LMStatus    ## how the final Levenberg–Marquardt run stopped; with the
                          ## fallback, `converged` may be true when this is not
@@ -123,14 +126,16 @@ proc ec50*(fit: DrcFit): float =
   ## The half-way dose. For 3PL and 4PL fits this is 10^LogEC50.
   fit.ecx(50.0)
 
+func deltaVariance(fit: DrcFit; grad: array[DrcParam, float]; params: Slice[DrcParam]): float =
+  ## gᵀ·cov·g over `params`, the delta-method variance of a function with gradient g.
+  for i in params:
+    for j in params:
+      result += grad[i] * fit.cov[i][j] * grad[j]
+
 func ecxInterval(fit: DrcFit; pct, tq: float): ConfInt =
-  # Delta method on log10(ECx).
+  # Delta method on log10(ECx), which does not depend on Bottom or Top.
   let (center, grad) = fit.logEcxAndGradient(pct)
-  var variance = 0.0
-  for i in LogEC50 .. Asymmetry:  # ECx does not depend on Bottom or Top
-    for j in LogEC50 .. Asymmetry:
-      variance += grad[i] * fit.cov[i][j] * grad[j]
-  let half = tq * sqrt(variance)
+  let half = tq * sqrt(fit.deltaVariance(grad, LogEC50 .. Asymmetry))
   (pow(10.0, center - half), pow(10.0, center + half))
 
 proc ecxCI*(fit: DrcFit; pct: float; level = 0.95): ConfInt =
@@ -148,11 +153,8 @@ proc bandAt(fit: DrcFit; dose, tq, extraVariance: float): Band =
     raise newException(ValueError, "dose must be finite and non-negative, got " & $dose)
   var grad: ParamVec
   let value = ll5(log10(dose), fit.params.toVec, grad)
-  var variance = extraVariance
-  for i in DrcParam:
-    for j in DrcParam:
-      variance += grad[ord(i)] * fit.cov[i][j] * grad[ord(j)]
-  let half = tq * sqrt(variance)
+  let half = tq * sqrt(fit.deltaVariance(grad.toParams, DrcParam.low .. DrcParam.high) +
+                       extraVariance)
   (value, value - half, value + half)
 
 proc confidenceBand*(fit: DrcFit; doses: openArray[float]; level = 0.95): seq[Band] =
@@ -162,19 +164,25 @@ proc confidenceBand*(fit: DrcFit; doses: openArray[float]; level = 0.95): seq[Ba
   for dose in doses: result.add fit.bandAt(dose, tq, 0.0)
 
 proc confidenceBand*(fit: DrcFit; dose: float; level = 0.95): Band =
-  fit.confidenceBand([dose], level)[0]
+  ## The band at one dose. For many doses, the `openArray` overload computes
+  ## the t quantile once.
+  fit.bandAt(dose, fit.tQuantile(level), 0.0)
+
+proc residualVariance(fit: DrcFit; weight: float): float =
+  if not (weight > 0.0 and weight < Inf):
+    raise newException(ValueError, "weight must be finite and positive, got " & $weight)
+  fit.sigma ^ 2 / weight
 
 proc predictionBand*(fit: DrcFit; doses: openArray[float]; level = 0.95; weight = 1.0): seq[Band] =
   ## Pointwise prediction band: where a new observation at each dose is
   ## expected to fall. It adds the residual variance σ²/`weight` to the
   ## confidence band, with `weight` on the same relative scale as the fit's.
-  if not (weight > 0.0 and weight < Inf):
-    raise newException(ValueError, "weight must be finite and positive, got " & $weight)
+  let extra = fit.residualVariance(weight)
   let tq = fit.tQuantile(level)
-  for dose in doses: result.add fit.bandAt(dose, tq, fit.sigma ^ 2 / weight)
+  for dose in doses: result.add fit.bandAt(dose, tq, extra)
 
 proc predictionBand*(fit: DrcFit; dose: float; level = 0.95; weight = 1.0): Band =
-  fit.predictionBand([dose], level, weight)[0]
+  fit.bandAt(dose, fit.tQuantile(level), fit.residualVariance(weight))
 
 func better(a, b: LMResult[drcParamCount]): bool =
   ## A lower SSR wins, and any finite SSR beats NaN. Within rounding of each
@@ -234,11 +242,13 @@ type IrlsResult = object
   converged: bool
 
 proc irls(x, y, w: openArray[float]; start: LMResult[drcParamCount];
-          free: array[drcParamCount, bool]; loss: Loss; c: float; opts: FitOptions): IrlsResult =
+          free: array[drcParamCount, bool]; loss: Loss; c, scaleFloor, tol: float;
+          opts: FitOptions): IrlsResult =
   ## M-estimation by iteratively reweighted least squares, as R's
   ## robustbase::nlrob. Each round takes the robust scale s of the current
-  ## residuals, weights observation i by wᵢ·ψ(uᵢ)/uᵢ with uᵢ = rᵢ/s, and refits.
-  ## It stops when the residuals change by less than `opts.irlsTol` (relative).
+  ## residuals (at least `scaleFloor`), weights observation i by wᵢ·ψ(uᵢ)/uᵢ
+  ## with uᵢ = rᵢ/s, and refits. It stops when a converged refit changes the
+  ## residuals by less than `tol` (relative).
   result.fit = start
   result.residuals = standardisedResiduals(x, y, w, start.params)
   var
@@ -248,22 +258,25 @@ proc irls(x, y, w: openArray[float]; start: LMResult[drcParamCount];
     used.setLen 0
     for i in 0 ..< x.len:
       if w[i] > 0.0: used.add result.residuals[i]
-    result.scale = madScale(used)
+    # Without the floor, a fit through more than half the points to rounding
+    # error would get a scale of ~1e-12 and reject every other point.
+    result.scale = max(madScale(used), scaleFloor)
     if not (result.scale > 0.0):
-      return  # most residuals are exactly zero, so there is no scale to weight by
+      # Only when the responses are all equal and fitted exactly: nothing to reweight.
+      result.converged = true
+      return
     for i in 0 ..< x.len:
       robustW[i] = w[i] * psiWeight(loss, result.residuals[i] / result.scale, c)
-    # Copy the start: the call writes its result straight into result.fit, and
-    # Nim passes the start array by reference, so it would read zeros.
-    let current = result.fit.params
-    result.fit = levenbergMarquardt(ll5, x, y, robustW, current, free, opts.lm)
+    result.fit = levenbergMarquardt(ll5, x, y, robustW, result.fit.params, free, opts.lm)
+    if result.fit.status in {lmStalled, lmBadStart}:
+      return  # these weights cannot be fitted; unchanged residuals would look converged
     let residuals = standardisedResiduals(x, y, w, result.fit.params)
     var change, size = 0.0
     for i in 0 ..< x.len:
       change += (residuals[i] - result.residuals[i]) ^ 2
       size += result.residuals[i] ^ 2
     result.residuals = residuals
-    if sqrt(change / max(size, 1e-20)) <= opts.irlsTol:
+    if result.fit.status.converged and sqrt(change / max(size, 1e-20)) <= tol:
       result.converged = true
       return
 
@@ -325,6 +338,10 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
     result.tuning = if opts.tuning.isNaN: defaultTuning(opts.loss) else: opts.tuning
     if not (result.tuning > 0.0 and result.tuning < Inf):
       raise newException(ValueError, "tuning must be finite and positive, got " & $opts.tuning)
+    if opts.irlsMaxIter < 1:
+      raise newException(ValueError, "irlsMaxIter must be at least 1, got " & $opts.irlsMaxIter)
+    if not (opts.irlsTol >= 0.0):
+      raise newException(ValueError, "irlsTol must be non-negative, got " & $opts.irlsTol)
 
   let nFree = drcParamCount - card(result.fixed)
   if result.n < max(nFree, 1):
@@ -344,33 +361,52 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
     # fit is never worse.
     best = levenbergMarquardt(ll5, x, y, w, nm.params, free, opts.lm)
     result.usedFallback = true
-    result.converged = best.status.converged or nm.converged
+    result.fallbackConverged = best.status.converged or nm.converged
+    result.converged = result.fallbackConverged
+
+  let meanY = sumWY / sumW
+  var sst = 0.0
+  for i in 0 ..< responses.len:
+    sst += w[i] * (responses[i] - meanY) ^ 2
 
   # A robust fit reweights from the least-squares fit.
-  var robustFit: IrlsResult
+  var
+    robustFit: IrlsResult
+    u: seq[float]  # residuals in units of the robust scale
   if result.loss != Squared:
+    # 1 ppm of the responses' (weighted RMS) spread: far below any real scatter.
+    let scaleFloor = 1e-6 * sqrt(sst / float(result.n))
     var start = best
     if result.loss == Tukey:
-      # Tukey's redescending ψ can stop in a local minimum, so start from Huber.
-      start = irls(x, responses, w, best, free, Huber, defaultTuning(Huber), opts).fit
-    robustFit = irls(x, responses, w, start, free, result.loss, result.tuning, opts)
+      # Tukey's redescending ψ can stop in a local minimum, so start from Huber,
+      # converged only as far as nlrob's default tolerance.
+      start = irls(x, responses, w, best, free, Huber, defaultTuning(Huber), scaleFloor,
+                   max(opts.irlsTol, 1e-6), opts).fit
+    robustFit = irls(x, responses, w, start, free, result.loss, result.tuning, scaleFloor,
+                     opts.irlsTol, opts)
     best = robustFit.fit
     result.converged = best.status.converged
     if not robustFit.converged: result.warnings.incl fwRobustNotConverged
+    u = newSeq[float](x.len)
     result.robustWeights = newSeq[float](x.len)
     for i in 0 ..< x.len:
       if w[i] > 0.0:
-        result.robustWeights[i] =
-          psiWeight(result.loss, robustFit.residuals[i] / robustFit.scale, result.tuning)
+        if robustFit.scale > 0.0: u[i] = robustFit.residuals[i] / robustFit.scale
+        result.robustWeights[i] = psiWeight(result.loss, u[i], result.tuning)
 
   result.params = best.params.toParams
-  result.ssr = weightedSsr(ll5, x, responses, w, best.params)
+  var
+    jtwj, unscaled: array[drcParamCount, array[drcParamCount, float]]
+    gradient: ParamVec
+  # Under the user weights, so robust fits report their plain weighted SSR too.
+  result.ssr = normalEquations(ll5, x, responses, w, best.params, jtwj, gradient)
   result.iterations = best.iterations
   result.status = best.status
   result.df = result.n - nFree
 
   if not result.converged:
     result.warnings.incl fwNotConverged
+  result.converged = result.warnings * {fwNotConverged, fwRobustNotConverged} == {}
   let logEC50 = log10(result.ec50)
   if not (logEC50 >= result.logDoseRange.lower and logEC50 <= result.logDoseRange.upper):
     result.warnings.incl fwEc50OutsideRange
@@ -386,25 +422,18 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
     # S = s²·Σψ(uᵢ)²/(n − p) and κ = 1 + p·var(ψ')/(n·mean(ψ')²).
     let s = robustFit.scale
     result.sigma = s
-    var sumPsi2, sumD, sumD2 = 0.0
+    var
+      sumPsi2 = 0.0
+      derivative: RunningStat  # of ψ'(uᵢ)
     for i in 0 ..< x.len:
       if w[i] > 0.0:
-        let u = robustFit.residuals[i] / s
-        sumPsi2 += psi(result.loss, u, result.tuning) ^ 2
-        let d = psiDerivative(result.loss, u, result.tuning)
-        sumD += d
-        sumD2 += d * d
+        sumPsi2 += psi(result.loss, u[i], result.tuning) ^ 2
+        derivative.push psiDerivative(result.loss, u[i], result.tuning)
     let
-      n = float(result.n)
-      meanD = sumD / n
-      varD = (sumD2 - n * meanD * meanD) / (n - 1.0)
-      kappa = 1.0 + float(nFree) * varD / (n * meanD * meanD)
+      meanD = derivative.mean
+      kappa = 1.0 + float(nFree) * derivative.varianceS / (float(result.n) * meanD * meanD)
     if result.df > 0 and meanD > 0.0:
       varianceScale = (kappa / meanD) ^ 2 * s * s * sumPsi2 / float(result.df)
-  var
-    jtwj, unscaled: array[drcParamCount, array[drcParamCount, float]]
-    gradient: ParamVec
-  discard normalEquations(ll5, x, responses, w, best.params, jtwj, gradient)
   if not unscaledCovariance(jtwj, free, unscaled): result.warnings.incl fwSingular
   if result.df == 0: result.warnings.incl fwNoResidualDf
   for i in DrcParam:
@@ -417,10 +446,6 @@ proc fitCurve(model: Model; doses, responses, weights: openArray[float];
     result.se[param] = sqrt(result.cov[param][param])
 
   # Goodness of fit.
-  let meanY = sumWY / sumW
-  var sst = 0.0
-  for i in 0 ..< responses.len:
-    sst += w[i] * (responses[i] - meanY) ^ 2
   result.rSquared = 1.0 - result.ssr / sst
   if result.loss == Squared:
     result.logLik = gaussianLogLik(result.ssr, result.n, sumLogW)
@@ -491,9 +516,12 @@ proc summary*(fit: DrcFit; level = 0.95): string =
     result.add &"Robust weight below 0.5: {strong} observations; 0 (rejected): {rejected}\n"
     result.add &"R²: {fit.rSquared:.6g}\n"
   if fit.usedFallback:
-    let outcome = if fit.converged: "converged" else: "did not converge"
-    result.add "Levenberg–Marquardt did not converge; the Nelder–Mead fallback " & outcome &
-               &" (final polishing run: {fit.status} after {fit.iterations} iterations)"
+    let outcome = if fit.fallbackConverged: "converged" else: "did not converge"
+    result.add "Levenberg–Marquardt did not converge; the Nelder–Mead fallback " & outcome
+    if fit.loss == Squared:
+      result.add &" (final polishing run: {fit.status} after {fit.iterations} iterations)"
+    else:
+      result.add &". Last reweighting round: {fit.status} after {fit.iterations} iterations"
   else:
     result.add &"Stopped after {fit.iterations} iterations: {fit.status}"
   for warning in fit.warnings:

@@ -47,6 +47,19 @@ suite "Levenberg-Marquardt":
     check abs(a[0][0] - expected) <= 1e-12 * expected
     check a[0][1] == a[1][0]
 
+  test "the start may alias the variable receiving the result":
+    # Arrays this large are passed by reference, and the result is built in place.
+    var x, w: seq[float]
+    for d in ryegrassDose:
+      x.add log10(d)
+      w.add 1.0
+    var holder: tuple[fit: LMResult[drcParamCount]]
+    holder.fit.params = [0.5, 7.8, 0.5, -3.0, 1.0]
+    let free = [true, true, true, true, false]
+    holder.fit = levenbergMarquardt(ll5, x, ryegrassRootLength, w, holder.fit.params, free)
+    check holder.fit.status.converged
+    check close(holder.fit.ssr, 5.400214650161578, 1e-9)
+
   test "non-finite start is reported":
     let r = levenbergMarquardt(expDecay, [1.0], [NaN], [1.0], [1.0, 1.0], [true, true])
     check r.status == lmBadStart

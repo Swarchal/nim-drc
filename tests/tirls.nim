@@ -154,3 +154,40 @@ suite "robust fits: options and edge cases":
   test "invalid tuning is rejected":
     expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Huber, tuning: 0.0))
     expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Tukey, tuning: -1.0))
+
+  test "ψ is bounded at infinite residuals":
+    check psi(Huber, Inf, 1.345) == 1.345
+    check psi(Huber, -Inf, 1.345) == -1.345
+    check psi(Tukey, Inf, 4.685) == 0.0
+
+  test "the robust scale does not collapse when most points fit exactly":
+    # A sharp step through exact plateau readings: without a floor on the scale,
+    # MAD is ~1e-12 and the exact readings at 100 are rejected.
+    let stepDose = [1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
+    let stepResp = [100.0, 100, 100, 150, 100, 0, 0, 0, 0, 0, 0]
+    for loss in [Huber, Tukey]:
+      let fit = fitLL4(stepDose, stepResp, opts = FitOptions(loss: loss))
+      check fit.sigma > 1e-6
+      for i, rw in fit.robustWeights:
+        if i == 3: check rw < 1e-3
+        else: check rw == 1.0
+
+  test "invalid reweighting options are rejected":
+    expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Huber, irlsMaxIter: 0))
+    expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Huber, irlsTol: NaN))
+    expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Tukey, irlsTol: -1.0))
+
+  test "unfinished reweighting is not reported as converged":
+    let fit = fitLL4(dose, response, opts = FitOptions(loss: Huber, irlsMaxIter: 3))
+    check fwRobustNotConverged in fit.warnings
+    check fwNotConverged notin fit.warnings  # each refit itself converged
+    check not fit.converged
+
+  test "the summary separates the fallback from the reweighting":
+    # Two iterations are too few for the least-squares stage, but the refits start
+    # from the converged fallback fit.
+    let fit = fitLL4(ryegrassDose, ryegrassRootLength,
+                     opts = FitOptions(loss: Huber, lm: LMOptions(maxIter: 2)))
+    check fit.usedFallback and fit.fallbackConverged
+    check fit.converged
+    check "the Nelder–Mead fallback converged. Last reweighting round:" in fit.summary

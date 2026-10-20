@@ -70,7 +70,8 @@ suite "Nelder–Mead fallback":
     check close(fit.params[LogEC50], 0.48543111513116, 1e-6)
     check close(fit.params[Hill], -2.9822286375650706, 1e-6)
     check close(fit.ssr, 5.400214650161578, 1e-10)
-    check "the Nelder–Mead fallback converged" in fit.summary
+    check fit.fallbackConverged
+    check "the Nelder–Mead fallback converged (final polishing run:" in fit.summary
 
   test "without the fallback, non-convergence is reported":
     let fit = fitLL4(ryegrassDose, ryegrassRootLength,

@@ -75,7 +75,7 @@ func stationary[K: static int](a: array[K, array[K, float]]; g: array[K, float];
 
 proc levenbergMarquardt*[K: static int; F](fn: F; x, y, w: openArray[float];
                                            p0: array[K, float]; free: array[K, bool];
-                                           opts = LMOptions()): LMResult[K] =
+                                           opts = LMOptions()): LMResult[K] {.noinit.} =
   ## Fits the parameters marked in `free`, holding the others at their value in `p0`.
   ## `fn(x: float; p: array[K, float]; grad: var array[K, float]): float` returns f(x, p) and
   ## writes ∂f/∂pⱼ into `grad`.
@@ -91,6 +91,9 @@ proc levenbergMarquardt*[K: static int; F](fn: F; x, y, w: openArray[float];
   # Residuals around 1e-10 of the data are rounding error: a perfect fit.
   let perfectSsr = 1e-20 * sumSquares
 
+  # The result may share memory with `p0` (e.g. `r.fit = levenbergMarquardt(..., r.fit.params)`),
+  # so it is reset only after `p0` has been copied; hence {.noinit.}.
+  result = default(LMResult[K])
   result.status = if ssr.isFinite: lmMaxIter else: lmBadStart
   while result.status == lmMaxIter and result.iterations < opts.maxIter:
     inc result.iterations
