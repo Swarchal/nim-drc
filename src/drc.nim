@@ -2,6 +2,7 @@
 ##
 ## .. code-block:: nim
 ##   let fit = fitLL4(doses, responses, fixed = [(Bottom, 0.0)])
+##   # or, with the model chosen at run time: fitCurve(LL4, doses, responses, ...)
 ##   echo fit.ec50, " ", fit.ec50CI
 ##   echo fit.summary
 
@@ -14,7 +15,7 @@ export lm, models, neldermead, robust, stats
 
 type
   Model* = enum
-    LL3 = "3PL" ## 4PL with Bottom fixed
+    LL3 = "3PL" ## 4PL with Bottom fixed (at 0, unless `fixed` gives it)
     LL4 = "4PL"
     LL5 = "5PL"
 
@@ -98,9 +99,20 @@ func toParams(v: ParamVec): array[DrcParam, float] =
   for param in DrcParam:
     result[param] = v[ord(param)]
 
+proc checkDose(dose: float) =
+  if not (dose >= 0.0 and dose < Inf):
+    raise newException(ValueError, "dose must be finite and non-negative, got " & $dose)
+
 proc predict*(fit: DrcFit, dose: float): float =
+  ## The fitted mean response at `dose` (0 gives the low-dose plateau).
+  checkDose(dose)
   var grad: ParamVec
   ll5(log10(dose), fit.params.toVec, grad)
+
+proc predict*(fit: DrcFit, doses: openArray[float]): seq[float] =
+  ## The fitted mean response at each dose.
+  for dose in doses:
+    result.add fit.predict(dose)
 
 proc tQuantile(fit: DrcFit, level: float): float =
   if not (level > 0.0 and level < 1.0):
@@ -178,8 +190,7 @@ proc ec50CI*(fit: DrcFit, level = 0.95): ConfInt =
 proc bandAt(fit: DrcFit, dose, tq, extraVariance: float): Band =
   ## The fitted response at `dose` ± tq·sqrt(Var(f̂) + extraVariance), with
   ## Var(f̂) = gᵀ·cov·g by the delta method.
-  if not (dose >= 0.0 and dose < Inf):
-    raise newException(ValueError, "dose must be finite and non-negative, got " & $dose)
+  checkDose(dose)
   var grad: ParamVec
   let value = ll5(log10(dose), fit.params.toVec, grad)
   let half =
@@ -351,8 +362,7 @@ proc irls(
       return
 
 proc checkObservation(dose, response, weight: float) =
-  if not (dose >= 0.0 and dose < Inf):
-    raise newException(ValueError, "dose must be finite and non-negative, got " & $dose)
+  checkDose(dose)
   if not response.isFinite:
     raise newException(ValueError, "response must be finite, got " & $response)
   if not (weight >= 0.0 and weight < Inf):
@@ -362,7 +372,8 @@ proc checkObservation(dose, response, weight: float) =
 proc resolveFixed(
     model: Model, fixed: openArray[(DrcParam, float)]
 ): tuple[values: ParamVec, params: set[DrcParam]] =
-  ## The fixed parameters and their values, including Asymmetry = 1 for 3PL/4PL.
+  ## The fixed parameters and their values, including Asymmetry = 1 for 3PL/4PL
+  ## and, for a 3PL that does not give Bottom, Bottom = 0.
   for (param, value) in fixed:
     if param == Asymmetry and model != LL5:
       raise newException(ValueError, "Asymmetry can only be fixed in a 5PL fit")
@@ -371,6 +382,9 @@ proc resolveFixed(
         newException(ValueError, "fixed " & $param & " must be finite, got " & $value)
     result.values[ord(param)] = value
     result.params.incl param
+  if model == LL3 and Bottom notin result.params:
+    result.values[ord(Bottom)] = 0.0
+    result.params.incl Bottom
   if model != LL5:
     result.values[ord(Asymmetry)] = 1.0
     result.params.incl Asymmetry
@@ -398,13 +412,28 @@ proc resolveBounds(
       )
     (result.lower[ord(param)], result.upper[ord(param)]) = (range.a, range.b)
 
-proc fitCurve(
+proc fitCurve*(
     model: Model,
-    doses, responses, weights: openArray[float],
-    fixed: openArray[(DrcParam, float)],
-    bounds: openArray[(DrcParam, Slice[float])],
-    opts: FitOptions,
+    doses, responses: openArray[float],
+    weights: openArray[float] = [],
+    fixed: openArray[(DrcParam, float)] = [],
+    bounds: openArray[(DrcParam, Slice[float])] = [],
+    opts = FitOptions(),
 ): DrcFit =
+  ## Fits `model` to `responses` at `doses` (linear scale; zero doses are
+  ## treated as untreated controls). `fitLL3`, `fitLL4` and `fitLL5` are
+  ## this with the model given.
+  ##
+  ## * `weights` are relative: the error variance of observation i is taken
+  ##   to be σ²/wᵢ, with σ² estimated from the fit. A weight of 0 excludes
+  ##   an observation.
+  ## * Parameters in `fixed` are held at the given value. A 3PL fixes Bottom
+  ##   at 0 unless `fixed` gives it; 3PL and 4PL fits fix Asymmetry at 1.
+  ## * Parameters in `bounds` are kept within their range, e.g.
+  ##   `bounds = [(Hill, -10.0 .. -0.1), (Top, -Inf .. 120.0)]`. A parameter
+  ##   that ends on a bound is listed in `fit.atBound` and raises `fwAtBound`;
+  ##   its standard error is computed as if it were unbounded, as R's
+  ##   `nls(algorithm = "port")` does.
   result.model = model
   if doses.len != responses.len:
     raise newException(ValueError, "doses and responses differ in length")
@@ -632,27 +661,19 @@ proc fitLL4*(
     bounds: openArray[(DrcParam, Slice[float])] = [],
     opts = FitOptions(),
 ): DrcFit =
-  ## Fits a four-parameter logistic to `responses` at `doses` (linear scale;
-  ## zero doses are treated as untreated controls). Parameters in `fixed`
-  ## are held at the given value. Weights are relative: the error variance
-  ## of observation i is taken to be σ²/wᵢ, with σ² estimated from the fit.
-  ##
-  ## Parameters in `bounds` are kept within their range, e.g.
-  ## `bounds = [(Hill, -10.0 .. -0.1), (Top, -Inf .. 120.0)]`. A parameter
-  ## that ends on a bound is listed in `fit.atBound` and raises `fwAtBound`;
-  ## its standard error is computed as if it were unbounded, as R's
-  ## `nls(algorithm = "port")` does.
+  ## Fits a four-parameter logistic (Hill equation); see `fitCurve`.
   fitCurve(LL4, doses, responses, weights, fixed, bounds, opts)
 
 proc fitLL3*(
     doses, responses: openArray[float],
     weights: openArray[float] = [],
-    bottom = 0.0,
+    fixed: openArray[(DrcParam, float)] = [],
     bounds: openArray[(DrcParam, Slice[float])] = [],
     opts = FitOptions(),
 ): DrcFit =
-  ## Fits a three-parameter logistic: the 4PL with Bottom fixed at `bottom`.
-  fitCurve(LL3, doses, responses, weights, [(Bottom, bottom)], bounds, opts)
+  ## Fits a three-parameter logistic: the 4PL with Bottom fixed, at 0 unless
+  ## `fixed` gives it (e.g. `fixed = [(Bottom, 5.0)]`); see `fitCurve`.
+  fitCurve(LL3, doses, responses, weights, fixed, bounds, opts)
 
 proc fitLL5*(
     doses, responses: openArray[float],
@@ -662,8 +683,8 @@ proc fitLL5*(
     opts = FitOptions(),
 ): DrcFit =
   ## Fits a five-parameter logistic, for curves that are not symmetric about
-  ## their midpoint. See `ll5` for the parameterisation; `ec50` and `ecx`
-  ## give the actual doses for a given response.
+  ## their midpoint; see `fitCurve`. See `ll5` for the parameterisation;
+  ## `ec50` and `ecx` give the actual doses for a given response.
   fitCurve(LL5, doses, responses, weights, fixed, bounds, opts)
 
 func boundNote(fit: DrcFit, param: DrcParam): string =

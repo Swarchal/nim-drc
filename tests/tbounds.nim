@@ -295,7 +295,7 @@ suite "joint fits with bounds":
     check fit.converged
     check fit.atBound == {Top}
     check fwAtBound in fit.warnings
-    check fit.params[fit.index[0][Top]] == 2.0
+    check fit.param(0, Top) == 2.0
     const
       expected = [
         0.0482560924153271, 2.0, 0.5090639705275717, 0.5011658447255355,
@@ -305,9 +305,12 @@ suite "joint fits with bounds":
         0.0119088734986862, 0.0458727820739963, 0.0212789838371984, 0.0213136532771704,
         0.0214177940751630, 0.0484449304973926,
       ]
-    for i in 0 ..< expected.len:
-      check near(fit.params[i], expected[i], se[i])
-      check close(sqrt(fit.cov[i][i]), se[i], 1e-5)
+      # nls's coefficient order b, t, l1, l2, l3, h as (curve, parameter)
+      coefs =
+        [(0, Bottom), (0, Top), (0, LogEC50), (1, LogEC50), (2, LogEC50), (0, Hill)]
+    for i, (c, param) in coefs:
+      check near(fit.param(c, param), expected[i], se[i])
+      check close(sqrt(fit.cov(c, param, c, param)), se[i], 1e-5)
     check close(fit.ssr, 0.0400669504426697, 1e-9)
     check fit.df == 42
     for c in 0 .. 2:

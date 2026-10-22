@@ -205,3 +205,21 @@ suite "fitLL4: synthetic data":
         weights = [0.0, 0.0, 0.0, 0.0, 0.0],
         fixed = [(Bottom, 0.0), (Top, 9.0), (LogEC50, 0.0), (Hill, 1.0)],
       )
+
+suite "predict":
+  let fit = fitLL4(ryegrassDose, ryegrassRootLength)
+
+  test "takes a sequence of doses":
+    let doses = [0.0, 1.0, 3.0, 30.0]
+    let fitted = fit.predict(doses)
+    check fitted.len == doses.len
+    for i, dose in doses:
+      check fitted[i] == fit.predict(dose)
+    check fitted[0] == fit.params[Top] # falling curve: zero dose is the Top plateau
+
+  test "rejects doses the bands reject":
+    for dose in [-1.0, NaN, Inf]:
+      expect ValueError:
+        discard fit.predict(dose)
+      expect ValueError:
+        discard fit.predict([1.0, dose])

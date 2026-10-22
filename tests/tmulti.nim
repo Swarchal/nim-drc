@@ -111,7 +111,7 @@ suite "joint fits match R nls (DNase)":
     check fit.converged
     check fit.warnings == {}
     check fit.n == 48 and fit.df == 42
-    check fit.params.len == 7 # Bottom, Top, 3 × LogEC50, Hill, Asymmetry (fixed)
+    check fit.n - fit.df == 6 # Bottom, Top, 3 × LogEC50, Hill
     let
       expected = [
         0.012153083145364535, 2.2960210356810506, 1.0022379964196355,
@@ -135,26 +135,21 @@ suite "joint fits match R nls (DNase)":
         -9.784555424271014e-05, 0.0011699882688050098, -0.00057642141848427016,
         0.00047581224280361515, 0.00047686158454947526, 0.00051437382454363144,
       ]
-      # R's coefficient order b, t, h, l1, l2, l3 as slots of the joint vector
-      slots = [
-        fit.index[0][Bottom],
-        fit.index[0][Top],
-        fit.index[0][Hill],
-        fit.index[0][LogEC50],
-        fit.index[1][LogEC50],
-        fit.index[2][LogEC50],
-      ]
-    for i, slot in slots:
-      check near(fit.params[slot], expected[i], se[i])
-      check close(sqrt(fit.cov[slot][slot]), se[i], 1e-5)
-      for j, other in slots:
-        check abs(fit.cov[slot][other] - vcov[6 * i + j]) <= 1e-5 * abs(vcov[6 * i + j])
+      # R's coefficient order b, t, h, l1, l2, l3 as (curve, parameter)
+      coefs =
+        [(0, Bottom), (0, Top), (0, Hill), (0, LogEC50), (1, LogEC50), (2, LogEC50)]
+    for i, (c, param) in coefs:
+      check near(fit.param(c, param), expected[i], se[i])
+      check close(sqrt(fit.cov(c, param, c, param)), se[i], 1e-5)
+      for j, (d, other) in coefs:
+        let v = fit.cov(c, param, d, other)
+        check abs(v - vcov[6 * i + j]) <= 1e-5 * abs(vcov[6 * i + j])
     check close(fit.ssr, 0.017877581773117615, 1e-8)
     check close(fit.aic, -228.76152210258857, 1e-8)
     check close(fit.bic, -215.66311502623333, 1e-8)
     # The views carry the shared values and their uncertainty.
     for c in 0 .. 2:
-      check fit.curves[c].params[Hill] == fit.params[fit.index[0][Hill]]
+      check fit.curves[c].params[Hill] == fit.param(0, Hill)
       check close(fit.curves[c].params[LogEC50], expected[3 + c], 1e-6)
       check close(fit.curves[c].se[Top], se[1], 1e-5)
       check fit.curves[c].df == 42
@@ -178,9 +173,7 @@ suite "joint fits match R nls (DNase)":
     # finding on the fitted curves, gradient by central differences.
     let fit = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top})
     check fit.converged
-    check near(
-      fit.params[fit.index[0][Bottom]], 0.011673323618921537, 0.0092397605852578713
-    )
+    check near(fit.param(0, Bottom), 0.011673323618921537, 0.0092397605852578713)
     check close(fit.curves[1].params[Hill], 1.0270339163214497, 1e-6)
     check close(fit.curves[2].params[LogEC50], 0.5982597126486634, 1e-6)
     check close(fit.curves[2].se[Hill], 0.030988720959629807, 1e-5)
@@ -226,11 +219,9 @@ suite "joint fits match R nls (DNase)":
     )
     check fit.n == 43 and fit.df == 37
     check fit.curves[1].n == 13
-    check near(
-      fit.params[fit.index[0][Bottom]], 0.0059287617775354053, 0.010642068841095056
-    )
-    check close(fit.params[fit.index[0][Top]], 2.3135156470532325, 1e-6)
-    check close(fit.params[fit.index[0][Hill]], 0.98505516143174987, 1e-6)
+    check near(fit.param(0, Bottom), 0.0059287617775354053, 0.010642068841095056)
+    check close(fit.param(0, Top), 2.3135156470532325, 1e-6)
+    check close(fit.param(0, Hill), 0.98505516143174987, 1e-6)
     check close(fit.curves[0].params[LogEC50], 0.63013919556039821, 1e-6)
     check close(fit.curves[1].params[LogEC50], 0.61663361491202162, 1e-6)
     check close(fit.curves[2].params[LogEC50], 0.60400232702416579, 1e-6)
@@ -244,9 +235,9 @@ suite "joint fits match R nls (DNase)":
     check fit.converged
     check fit.df == 43
     check Bottom in fit.fixed and Bottom in fit.shared
-    check fit.params[fit.index[0][Bottom]] == 0.0
-    check close(fit.params[fit.index[0][Top]], 2.3404023237518992, 1e-6)
-    check close(fit.params[fit.index[0][Hill]], 0.97194346869682302, 1e-6)
+    check fit.param(0, Bottom) == 0.0
+    check close(fit.param(0, Top), 2.3404023237518992, 1e-6)
+    check close(fit.param(0, Hill), 0.97194346869682302, 1e-6)
     check close(fit.curves[1].params[LogEC50], 0.6316735935066734, 1e-6)
     check close(fit.curves[2].se[LogEC50], 0.021523777346403494, 1e-5)
     check fit.curves[0].se[Bottom] == 0.0
@@ -273,16 +264,16 @@ suite "joint fits match R nls (simulated)":
           curve.add c
     let fit = fitLL4Multi(doses, y, curve, shared = {Bottom, Top, Hill})
     check fit.converged
-    check close(fit.params[fit.index[0][Bottom]], 7.13590098008161, 1e-6)
-    check close(fit.params[fit.index[0][Top]], 99.251720675476605, 1e-6)
-    check close(fit.params[fit.index[0][Hill]], -1.2430191739060219, 1e-6)
+    check close(fit.param(0, Bottom), 7.13590098008161, 1e-6)
+    check close(fit.param(0, Top), 99.251720675476605, 1e-6)
+    check close(fit.param(0, Hill), -1.2430191739060219, 1e-6)
     check close(fit.curves[0].params[LogEC50], -6.3016157818636929, 1e-6)
     check close(fit.curves[1].params[LogEC50], -5.727616082086584, 1e-6)
     check close(fit.curves[0].se[Bottom], 0.87537809766560548, 1e-5)
     check close(fit.curves[1].se[LogEC50], 0.022493025100516997, 1e-5)
     check close(fit.ssr, 223.74695123800646, 1e-8)
     # Controls sit on the low-dose plateau of each curve.
-    check close(fit.curves[1].predict(0.0), fit.params[fit.index[0][Top]], 1e-12)
+    check close(fit.curves[1].predict(0.0), fit.param(0, Top), 1e-12)
 
   test "5PL with shared Asymmetry":
     const y = [
@@ -301,11 +292,11 @@ suite "joint fits match R nls (simulated)":
           curve.add c
     let fit = fitLL5Multi(doses, y, curve, shared = {Bottom, Top, Hill, Asymmetry})
     check fit.converged
-    check fit.params.len == 6
-    check close(fit.params[fit.index[0][Bottom]], 4.3933639193057008, 1e-5)
-    check close(fit.params[fit.index[0][Top]], 95.575022100491481, 1e-6)
-    check close(fit.params[fit.index[0][Hill]], 1.2468468905757522, 1e-5)
-    check close(fit.params[fit.index[0][Asymmetry]], 0.479746422442341, 1e-5)
+    check fit.n - fit.df == 6 # 4 shared, LogEC50 for each curve
+    check close(fit.param(0, Bottom), 4.3933639193057008, 1e-5)
+    check close(fit.param(0, Top), 95.575022100491481, 1e-6)
+    check close(fit.param(0, Hill), 1.2468468905757522, 1e-5)
+    check close(fit.param(0, Asymmetry), 0.479746422442341, 1e-5)
     check close(fit.curves[0].params[LogEC50], -6.2267271894299414, 1e-6)
     check close(fit.curves[1].params[LogEC50], -5.588832883366563, 1e-6)
     check close(fit.curves[0].se[Asymmetry], 0.084518932668916705, 1e-4)
@@ -339,7 +330,7 @@ suite "joint fits: consistency":
     let joint =
       fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top, LogEC50, Hill})
     let pooled = fitLL4(doses, dnaseDensity)
-    check joint.params.len == 5
+    check joint.n - joint.df == 4
     for param in Bottom .. Hill:
       check near(
         joint.curves[2].params[param], pooled.params[param], pooled.se[param], 1e-5
@@ -447,3 +438,33 @@ suite "joint fits: input checks":
     let pooled = fitLL4Multi(doses, dnaseDensity, newSeq[int](doses.len))
     let t = fTest(pooled, parallel)
     check t.df1 == 2 and t.p < 0.05
+
+suite "MultiFit accessors":
+  let (doses, curve) = dnase()
+  let fit = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top, Hill})
+
+  test "fitMulti takes the model as an argument":
+    let direct = fitMulti(LL4, doses, dnaseDensity, curve, shared = {Bottom, Top, Hill})
+    check direct.ssr == fit.ssr
+    for c in 0 .. 2:
+      check direct.curves[c].params == fit.curves[c].params
+
+  test "param and cov agree with the per-curve views":
+    for c in 0 .. 2:
+      for p in DrcParam:
+        check fit.param(c, p) == fit.curves[c].params[p]
+        for q in DrcParam:
+          check fit.cov(c, p, c, q) == fit.curves[c].cov[p][q]
+
+  test "cov spans curves":
+    # Shared parameters are one slot, so across curves their covariance is the variance.
+    check fit.cov(0, Hill, 2, Hill) == fit.cov(1, Hill, 1, Hill)
+    check fit.cov(0, LogEC50, 1, LogEC50) != 0.0
+    check fit.cov(0, LogEC50, 1, LogEC50) == fit.cov(1, LogEC50, 0, LogEC50)
+    check fit.cov(0, Asymmetry, 1, Hill) == 0.0 # fixed
+
+  test "a curve that does not exist raises":
+    expect ValueError:
+      discard fit.param(3, Hill)
+    expect ValueError:
+      discard fit.cov(0, Hill, -1, Hill)

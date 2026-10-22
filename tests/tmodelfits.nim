@@ -93,6 +93,33 @@ suite "3PL":
     check close(three.params[Top], 7.85542760957709, 1e-6)
     check "3PL fit" in three.summary
 
+  test "other parameters can be fixed too":
+    # R: nls(y ~ 8 / (1 + 10^((l - x) * h))), Bottom 0 and Top 8.
+    let fit = fitLL3(ryegrassDose, ryegrassRootLength, fixed = [(Top, 8.0)])
+    check fit.fixed == {Bottom, Top, Asymmetry}
+    check fit.params[Bottom] == 0.0
+    check fit.df == 22
+    check close(fit.params[LogEC50], 0.505077191573042, 1e-6)
+    check close(fit.params[Hill], -2.382204419041793, 1e-6)
+    check close(fit.se[Hill], 0.2672734008619120, 1e-5)
+    check close(fit.ssr, 6.77901528285181, 1e-9)
+
   test "Bottom can be fixed at another value":
-    let fit = fitLL3(ryegrassDose, ryegrassRootLength, bottom = 0.5)
+    let fit = fitLL3(ryegrassDose, ryegrassRootLength, fixed = [(Bottom, 0.5)])
     check fit.params[Bottom] == 0.5
+
+suite "fitCurve":
+  test "takes the model as an argument":
+    for model in [LL3, LL4, LL5]:
+      let fit = fitCurve(model, ryegrassDose, ryegrassRootLength)
+      let wrapped =
+        case model
+        of LL3:
+          fitLL3(ryegrassDose, ryegrassRootLength)
+        of LL4:
+          fitLL4(ryegrassDose, ryegrassRootLength)
+        of LL5:
+          fitLL5(ryegrassDose, ryegrassRootLength)
+      check fit.model == model
+      check fit.params == wrapped.params
+      check fit.se == wrapped.se

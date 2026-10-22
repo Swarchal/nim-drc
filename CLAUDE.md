@@ -24,8 +24,8 @@ The layers, from bottom to top:
 - `src/drc/robust.nim`: Huber/Tukey ψ, weights ψ(u)/u, ψ′, and the MAD scale (median|r|/0.6745, as `nlrob`/`rlm`).
 - `src/drc/stats.nim`: incomplete beta, Student t CDF/quantile (Newton inside a bisection bracket), F upper tail (`fTail`), covariance, Gaussian log-likelihood matching R's `logLik.nls`.
 - `src/drc/models.nim`: **one model, `ll5`** (five-parameter logistic in x = log10 dose), plus `drcGuess` for starting values.
-- `src/drc.nim`: public API. `fitLL3`/`fitLL4`/`fitLL5` are thin wrappers over a single private `fitCurve`. It returns a `DrcFit`.
-- `src/drc/multi.nim`: joint fits of several curves (`fitLL4Multi` etc. → `MultiFit`, `relativePotency`, `fTest`). It is `include`d at the end of `drc.nim` (not imported), so it can use that module's private helpers (`fitCurve`, `logEcxAndGradient`, `tQuantile`, `resolveFixed`, …).
+- `src/drc.nim`: public API. `fitCurve(model, …)` returns a `DrcFit`, and `fitLL3`/`fitLL4`/`fitLL5` are one-line wrappers over it with identical arguments. For LL3, `resolveFixed` adds Bottom = 0 unless `fixed` gives Bottom.
+- `src/drc/multi.nim`: joint fits of several curves (`fitMulti(model, …)` and the `fitLL4Multi` etc. wrappers → `MultiFit`; `param`/`cov` accessors; `relativePotency`, `fTest`). It is `include`d at the end of `drc.nim` (not imported), so it can use that module's private helpers (`fitCurve`, `logEcxAndGradient`, `tQuantile`, `resolveFixed`, …).
 
 Design decisions that span files:
 
@@ -46,7 +46,7 @@ Design decisions that span files:
 - **Fixed parameters:** standard error 0, covariance rows 0, and they don't count toward `df`/AIC. Standard errors are NaN when unidentifiable or when df = 0, and problems are reported in `fit.warnings`, not raised. Invalid input raises `ValueError`.
 - **Weights** are relative (variance σ²/wᵢ, as in R's `nls`). Zero-weight points are excluded from `n`, `df`, AIC and the starting guess.
 - **Joint fits** (`fitMulti`):
-  - The joint vector has one slot per shared parameter and one per curve for each unshared one, ordered by `DrcParam` then curve; `index[c][param]` is the slot. Fixed parameters are global, count as shared, and are pinned with the usual machinery.
+  - The joint vector has one slot per shared parameter and one per curve for each unshared one, ordered by `DrcParam` then curve; the private `slots[c][param]` is the slot in the private `joint`/`jointFree`/`jointCov`. The public view is `fit.param(c, p)` and `fit.cov(a, pa, b, pb)`. Fixed parameters are global, count as shared, and are pinned with the usual machinery.
   - LM sees the observation index as x, and a closure maps the joint vector to that observation's curve's 5-vector, calls `ll5` and scatters the gradient.
   - Starts come from per-curve `fitCurve` fits (falling back to `drcGuess` for curves too small to fit alone), with shared parameters at the median over curves, plus a start from the pooled fit. The multi-start grid and the symmetric-then-asymmetric 5PL stage mirror `searchLM`. There is no Nelder–Mead fallback, and robust losses raise `ValueError`.
   - `fit.curves[c]` is a `DrcFit` view: curve c's 5×5 covariance block, the joint df and pooled σ, its own n/ssr/R²/dose range. `logLik`/`aic`/`bic` are NaN on views, so single-curve inference works on them unchanged.
@@ -68,3 +68,6 @@ Design decisions that span files:
 ## Formatting conventions
 
 - Code should be formatted with `nph` or if `nph` is not available, manually formatted to a similar style.
+
+## Version control
+- Do not make any commits.

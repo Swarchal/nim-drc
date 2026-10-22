@@ -34,8 +34,13 @@ f(x) = Bottom + (Top − Bottom) / (1 + 10^((LogEC50 − x) · Hill))^Asymmetry
 | Function | Model | Free parameters |
 |---|---|---|
 | `fitLL4` | 4PL (Hill equation) | Bottom, Top, LogEC50, Hill; Asymmetry is fixed at 1 |
-| `fitLL3` | 3PL | as 4PL, with Bottom fixed (at 0 by default) |
+| `fitLL3` | 3PL | as 4PL, with Bottom fixed (at 0 unless `fixed` gives it) |
 | `fitLL5` | 5PL | all five, for curves that are not symmetric about their midpoint |
+
+Each is `fitCurve` with the model given, so `fitCurve(LL5, doses, responses)`
+is `fitLL5(doses, responses)`. Use `fitCurve` to choose the model at run time,
+for example to compare `[LL4, LL5]` by AIC in a loop. All of them take the
+same `weights`, `fixed`, `bounds` and `opts` arguments.
 
 - **Hill > 0** gives a rising curve and **Hill < 0** a falling one (inhibition).
   Fits are reported with Bottom < Top.
@@ -108,7 +113,8 @@ Hill = -0.89 ± 0.04
 ```
 
 Fixed parameters have a standard error of 0 and do not count towards the
-degrees of freedom. A 3PL with only Bottom fixed is `fitLL3(doses, viability)`.
+degrees of freedom. A 3PL with only Bottom fixed is `fitLL3(doses, viability)`,
+or `fitLL3(doses, viability, fixed = [(Bottom, 5.0)])` for a Bottom other than 0.
 
 ### Bounded parameters
 
@@ -418,6 +424,11 @@ shared-slope model is a fair basis for the potency ratio.
   `predict` and the bands work on it. Its covariance is curve c's block of the
   joint covariance, and its `df` and `sigma` are the joint fit's (σ is pooled
   over all curves).
+- **`fit.param(c, Hill)`** is curve c's estimate. **`fit.cov(a, LogEC50, b, LogEC50)`**
+  is a covariance from the joint fit, including between curves (for a shared
+  parameter, it is that parameter's variance).
+- **`fitMulti(model, …)`** is `fitLL4Multi` and its siblings with the model
+  given as an argument.
 - **`relativePotency(a, b, pct = 50)`** is ECx of curve a over ECx of curve b.
   Its interval comes from the delta method on log10 of the ratio, using the
   joint covariance, so it is asymmetric. R drc's `EDcomp` uses the ratio scale
@@ -518,8 +529,8 @@ For the parameter covariance, build JᵀWJ at the solution with
 
 | File | Contents |
 |---|---|
-| `src/drc.nim` | public API: `fitLL3`/`fitLL4`/`fitLL5`, `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `predict`, `confidenceBand`, `predictionBand` |
-| `src/drc/multi.nim` | joint fits of several curves: `fitLL4Multi` etc., `MultiFit`, `relativePotency`, `fTest` (included by `drc.nim`) |
+| `src/drc.nim` | public API: `fitCurve` (and `fitLL3`/`fitLL4`/`fitLL5`), `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `predict`, `confidenceBand`, `predictionBand` |
+| `src/drc/multi.nim` | joint fits of several curves: `fitMulti` (and `fitLL4Multi` etc.), `MultiFit`, `param`, `cov`, `relativePotency`, `fTest` (included by `drc.nim`) |
 | `src/drc/models.nim` | the 5PL model with its analytic gradient, and initial guesses |
 | `src/drc/lm.nim` | Levenberg–Marquardt for weighted least squares |
 | `src/drc/neldermead.nim` | Nelder–Mead simplex minimisation |
