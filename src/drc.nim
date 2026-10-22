@@ -25,6 +25,8 @@ type
     fwNoResidualDf = "no residual degrees of freedom; standard errors unavailable"
     fwEc50OutsideRange = "EC50 lies outside the tested dose range"
     fwRobustNotConverged = "the robust reweighting did not converge"
+    fwAtBound =
+      "a parameter is at a bound; its standard error and interval ignore the bound"
 
   FitOptions* = object
     lm*: LMOptions = LMOptions()
@@ -53,6 +55,9 @@ type
     cov*: array[DrcParam, array[DrcParam, float]]
       ## parameter covariance, σ²(JᵀWJ)⁻¹
     fixed*: set[DrcParam] ## includes Asymmetry (= 1) for 3PL and 4PL fits
+    lower*, upper*: array[DrcParam, float]
+      ## the bounds on each parameter: −Inf and Inf when unbounded
+    atBound*: set[DrcParam] ## free parameters that ended on a bound
     n*: int ## observations with non-zero weight
     df*: int ## residual degrees of freedom: n − number of free parameters
     ssr*: float ## weighted residual sum of squares
@@ -82,6 +87,8 @@ type
     warnings*: set[FitWarning]
 
   ParamVec = array[drcParamCount, float]
+
+  Box = tuple[lower, upper: ParamVec] ## bounds on each parameter, ±Inf if none
 
 func toVec(p: array[DrcParam, float]): ParamVec =
   for param in DrcParam:
@@ -230,11 +237,13 @@ proc multiStart(
     x, y, w: openArray[float],
     p0: ParamVec,
     free: array[drcParamCount, bool],
+    box: Box,
     opts: FitOptions,
 ): LMResult[drcParamCount] =
   ## Levenberg–Marquardt from `p0` and, with `opts.multiStart`, from starts with
   ## LogEC50 shifted by ±1 and Hill scaled by 0.4 or 2.5; the best fit wins.
-  result = levenbergMarquardt(ll5, x, y, w, p0, free, opts.lm)
+  ## Starts outside `box` are clamped into it.
+  result = levenbergMarquardt(ll5, x, y, w, p0, free, box.lower, box.upper, opts.lm)
   if not opts.multiStart:
     return
   for shift in [0.0, -1.0, 1.0]:
@@ -245,7 +254,7 @@ proc multiStart(
       var p = p0
       p[ord(LogEC50)] += shift
       p[ord(Hill)] *= scale
-      let r = levenbergMarquardt(ll5, x, y, w, p, free, opts.lm)
+      let r = levenbergMarquardt(ll5, x, y, w, p, free, box.lower, box.upper, opts.lm)
       if r.better(result):
         result = r
 
@@ -253,23 +262,27 @@ proc searchLM(
     x, y, w: openArray[float],
     p0: ParamVec,
     free: array[drcParamCount, bool],
+    box: Box,
     opts: FitOptions,
 ): LMResult[drcParamCount] =
+  ## `p0` must lie within `box`, since the symmetric stage of a 5PL holds
+  ## Asymmetry at its starting value.
   if not free[ord(Asymmetry)]:
-    return multiStart(x, y, w, p0, free, opts)
+    return multiStart(x, y, w, p0, free, box, opts)
   # 5PL: fit the symmetric curve first, then release Asymmetry from there.
   var symmetric = free
   symmetric[ord(Asymmetry)] = false
-  let base = multiStart(x, y, w, p0, symmetric, opts)
+  let base = multiStart(x, y, w, p0, symmetric, box, opts)
   result = base
-  let released = levenbergMarquardt(ll5, x, y, w, base.params, free, opts.lm)
+  let released =
+    levenbergMarquardt(ll5, x, y, w, base.params, free, box.lower, box.upper, opts.lm)
   if released.better(result):
     result = released
   if opts.multiStart:
     for a in [0.5, 2.0]:
       var p = base.params
       p[ord(Asymmetry)] = a
-      let r = levenbergMarquardt(ll5, x, y, w, p, free, opts.lm)
+      let r = levenbergMarquardt(ll5, x, y, w, p, free, box.lower, box.upper, opts.lm)
       if r.better(result):
         result = r
 
@@ -291,6 +304,7 @@ proc irls(
     x, y, w: openArray[float],
     start: LMResult[drcParamCount],
     free: array[drcParamCount, bool],
+    box: Box,
     loss: Loss,
     c: float,
     scaleFloor: float,
@@ -321,8 +335,9 @@ proc irls(
       return
     for i in 0 ..< x.len:
       robustW[i] = w[i] * psiWeight(loss, result.residuals[i] / result.scale, c)
-    result.fit =
-      levenbergMarquardt(ll5, x, y, robustW, result.fit.params, free, opts.lm)
+    result.fit = levenbergMarquardt(
+      ll5, x, y, robustW, result.fit.params, free, box.lower, box.upper, opts.lm
+    )
     if result.fit.status in {lmStalled, lmBadStart}:
       return # these weights cannot be fitted; unchanged residuals would look converged
     let residuals = standardisedResiduals(x, y, w, result.fit.params)
@@ -362,10 +377,32 @@ proc resolveFixed(
   if Asymmetry in result.params and not (result.values[ord(Asymmetry)] > 0.0):
     raise newException(ValueError, "Asymmetry must be positive")
 
+proc resolveBounds(
+    model: Model, fixed: set[DrcParam], bounds: openArray[(DrcParam, Slice[float])]
+): Box =
+  ## The bounds on each parameter, ±Inf where none is given.
+  for j in 0 ..< drcParamCount:
+    (result.lower[j], result.upper[j]) = (-Inf, Inf)
+  for (param, range) in bounds:
+    if param == Asymmetry and model != LL5:
+      raise newException(ValueError, "Asymmetry can only be bounded in a 5PL fit")
+    if param in fixed:
+      raise newException(ValueError, $param & " is fixed and cannot also be bounded")
+    if range.a.isNaN or range.b.isNaN:
+      raise newException(ValueError, "bounds on " & $param & " must not be NaN")
+    if not (range.a < range.b):
+      raise newException(
+        ValueError,
+        "the lower bound on " & $param & " must be below the upper one, got " & $range.a &
+          " .. " & $range.b & " (to hold it at one value, fix it)",
+      )
+    (result.lower[ord(param)], result.upper[ord(param)]) = (range.a, range.b)
+
 proc fitCurve(
     model: Model,
     doses, responses, weights: openArray[float],
     fixed: openArray[(DrcParam, float)],
+    bounds: openArray[(DrcParam, Slice[float])],
     opts: FitOptions,
 ): DrcFit =
   result.model = model
@@ -409,6 +446,10 @@ proc fitCurve(
   var free: array[drcParamCount, bool]
   for param in DrcParam:
     free[ord(param)] = param notin fixedParams
+  let box = resolveBounds(model, fixedParams, bounds)
+  for param in DrcParam:
+    result.lower[param] = box.lower[ord(param)]
+    result.upper[param] = box.upper[ord(param)]
 
   result.loss = opts.loss
   if opts.loss != Squared:
@@ -437,8 +478,10 @@ proc fitCurve(
         "non-zero weight to fit " & $nFree & " parameters, got " & $result.n,
     )
 
-  let p0 = drcGuess(guessX, guessY, fixedValues, result.fixed)
-  var best = searchLM(x, responses, w, p0, free, opts)
+  var p0 = drcGuess(guessX, guessY, fixedValues, result.fixed)
+  for j in 0 ..< drcParamCount:
+    p0[j] = clamp(p0[j], box.lower[j], box.upper[j])
+  var best = searchLM(x, responses, w, p0, free, box, opts)
   result.converged = best.status.converged
   if opts.fallback and not result.converged:
     # Nelder–Mead needs no derivatives; Levenberg–Marquardt then polishes its result.
@@ -449,11 +492,14 @@ proc fitCurve(
         weightedSsr(ll5, x, y, w, p),
       start,
       free,
+      box.lower,
+      box.upper,
       opts.nelderMead,
     )
     # Each stage only goes downhill from the best fit so far, so the polished
     # fit is never worse.
-    best = levenbergMarquardt(ll5, x, y, w, nm.params, free, opts.lm)
+    best =
+      levenbergMarquardt(ll5, x, y, w, nm.params, free, box.lower, box.upper, opts.lm)
     result.usedFallback = true
     result.fallbackConverged = best.status.converged or nm.converged
     result.converged = result.fallbackConverged
@@ -480,6 +526,7 @@ proc fitCurve(
         w,
         best,
         free,
+        box,
         Huber,
         defaultTuning(Huber),
         scaleFloor,
@@ -487,7 +534,7 @@ proc fitCurve(
         opts,
       ).fit
     robustFit = irls(
-      x, responses, w, start, free, result.loss, result.tuning, scaleFloor,
+      x, responses, w, start, free, box, result.loss, result.tuning, scaleFloor,
       opts.irlsTol, opts,
     )
     best = robustFit.fit
@@ -503,6 +550,12 @@ proc fitCurve(
         result.robustWeights[i] = psiWeight(result.loss, u[i], result.tuning)
 
   result.params = best.params.toParams
+  for param in DrcParam:
+    if param notin result.fixed and
+        result.params[param] in [result.lower[param], result.upper[param]]:
+      result.atBound.incl param
+  if result.atBound != {}:
+    result.warnings.incl fwAtBound
   var
     jtwj, unscaled: array[drcParamCount, array[drcParamCount, float]]
     gradient: ParamVec
@@ -520,7 +573,8 @@ proc fitCurve(
     result.warnings.incl fwEc50OutsideRange
 
   # Uncertainty: cov = varianceScale · (JᵀWJ)⁻¹ over the free parameters, with
-  # varianceScale = σ² for least squares.
+  # varianceScale = σ² for least squares. Parameters at a bound count as free,
+  # as in R's nls(algorithm = "port") and SciPy's curve_fit.
   var varianceScale = NaN
   if result.loss == Squared:
     if result.df > 0:
@@ -575,33 +629,51 @@ proc fitLL4*(
     doses, responses: openArray[float],
     weights: openArray[float] = [],
     fixed: openArray[(DrcParam, float)] = [],
+    bounds: openArray[(DrcParam, Slice[float])] = [],
     opts = FitOptions(),
 ): DrcFit =
   ## Fits a four-parameter logistic to `responses` at `doses` (linear scale;
   ## zero doses are treated as untreated controls). Parameters in `fixed`
   ## are held at the given value. Weights are relative: the error variance
   ## of observation i is taken to be σ²/wᵢ, with σ² estimated from the fit.
-  fitCurve(LL4, doses, responses, weights, fixed, opts)
+  ##
+  ## Parameters in `bounds` are kept within their range, e.g.
+  ## `bounds = [(Hill, -10.0 .. -0.1), (Top, -Inf .. 120.0)]`. A parameter
+  ## that ends on a bound is listed in `fit.atBound` and raises `fwAtBound`;
+  ## its standard error is computed as if it were unbounded, as R's
+  ## `nls(algorithm = "port")` does.
+  fitCurve(LL4, doses, responses, weights, fixed, bounds, opts)
 
 proc fitLL3*(
     doses, responses: openArray[float],
     weights: openArray[float] = [],
     bottom = 0.0,
+    bounds: openArray[(DrcParam, Slice[float])] = [],
     opts = FitOptions(),
 ): DrcFit =
   ## Fits a three-parameter logistic: the 4PL with Bottom fixed at `bottom`.
-  fitCurve(LL3, doses, responses, weights, [(Bottom, bottom)], opts)
+  fitCurve(LL3, doses, responses, weights, [(Bottom, bottom)], bounds, opts)
 
 proc fitLL5*(
     doses, responses: openArray[float],
     weights: openArray[float] = [],
     fixed: openArray[(DrcParam, float)] = [],
+    bounds: openArray[(DrcParam, Slice[float])] = [],
     opts = FitOptions(),
 ): DrcFit =
   ## Fits a five-parameter logistic, for curves that are not symmetric about
   ## their midpoint. See `ll5` for the parameterisation; `ec50` and `ecx`
   ## give the actual doses for a given response.
-  fitCurve(LL5, doses, responses, weights, fixed, opts)
+  fitCurve(LL5, doses, responses, weights, fixed, bounds, opts)
+
+func boundNote(fit: DrcFit, param: DrcParam): string =
+  if param in fit.atBound:
+    if fit.params[param] == fit.lower[param]:
+      "  (at lower bound)"
+    else:
+      "  (at upper bound)"
+  else:
+    ""
 
 proc summary*(fit: DrcFit, level = 0.95): string =
   ## A printable table of estimates, standard errors and confidence intervals.
@@ -621,7 +693,8 @@ proc summary*(fit: DrcFit, level = 0.95): string =
       result.add &"{$param:<10}{fit.params[param]:>12.6g}{\"(fixed)\":>12}\n"
     else:
       let ci = fit.waldInterval(param, tq)
-      result.add &"{$param:<10}{fit.params[param]:>12.6g}{fit.se[param]:>12.6g}{ci.lower:>14.6g}{ci.upper:>14.6g}\n"
+      result.add &"{$param:<10}{fit.params[param]:>12.6g}{fit.se[param]:>12.6g}{ci.lower:>14.6g}{ci.upper:>14.6g}"
+      result.add fit.boundNote(param) & "\n"
   let ci = fit.ecxInterval(50.0, tq)
   result.add &"{\"EC50\":<10}{fit.ec50:>12.6g}{\"\":>12}{ci.lower:>14.6g}{ci.upper:>14.6g}\n\n"
   if fit.loss == Squared:

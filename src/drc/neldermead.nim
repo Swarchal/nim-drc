@@ -17,44 +17,66 @@ type
     converged*: bool
 
 proc nelderMead*[K: static int, F](
-    f: F, p0: array[K, float], free: array[K, bool], opts = NMOptions()
+    f: F,
+    p0: array[K, float],
+    free: array[K, bool],
+    lower, upper: array[K, float],
+    opts = NMOptions(),
 ): NMResult[K] =
   ## Minimises `f(p: array[K, float]): float` over the parameters marked in
-  ## `free`, holding the others at their value in `p0`. NaN values count as +Inf.
+  ## `free`, within `lower` ≤ p ≤ `upper` (±Inf for no bound), holding the
+  ## others at their value in `p0`. NaN values count as +Inf. Every vertex is
+  ## clamped into the bounds, as SciPy's bounded Nelder–Mead.
   var idx: seq[int]
   for j in 0 ..< K:
     if free[j]:
       idx.add j
   let m = idx.len
 
+  proc project(p: array[K, float]): array[K, float] =
+    result = p
+    for j in idx:
+      result[j] = clamp(p[j], lower[j], upper[j])
+
   template eval(p: array[K, float]): float =
     inc result.evaluations
     let v = f(p)
     if v.isNaN: Inf else: v
 
+  let start = project(p0)
   if m == 0:
     # Nothing to optimise.
-    result.params = p0
-    result.value = eval(p0)
+    result.params = start
+    result.value = eval(start)
     result.converged = true
     return
 
-  # Initial simplex: p0 plus a 10% step (or 0.1 from zero) along each free axis.
+  # Initial simplex: the start plus a 10% step (or 0.1 from zero) along each
+  # free axis, stepping down instead where that would cross the upper bound.
   var
     simplex = newSeq[array[K, float]](m + 1)
     values = newSeq[float](m + 1)
   for i in 0 .. m:
-    simplex[i] = p0
+    simplex[i] = start
     if i > 0:
       let j = idx[i - 1]
-      simplex[i][j] += (if p0[j] != 0.0: 0.1 * abs(p0[j]) else: 0.1)
+      let step =
+        if start[j] != 0.0:
+          0.1 * abs(start[j])
+        else:
+          0.1
+      simplex[i][j] =
+        if start[j] + step <= upper[j]:
+          start[j] + step
+        else:
+          max(start[j] - step, lower[j])
     values[i] = eval(simplex[i])
 
   proc along(a, b: array[K, float], t: float): array[K, float] =
-    ## a + t · (b − a) on the free coordinates.
+    ## a + t · (b − a) on the free coordinates, clamped into the bounds.
     result = a
     for j in idx:
-      result[j] = a[j] + t * (b[j] - a[j])
+      result[j] = clamp(a[j] + t * (b[j] - a[j]), lower[j], upper[j])
 
   while true:
     # Order the vertices: best first, worst last.
@@ -115,3 +137,12 @@ proc nelderMead*[K: static int, F](
 
   result.params = simplex[0]
   result.value = values[0]
+
+proc nelderMead*[K: static int, F](
+    f: F, p0: array[K, float], free: array[K, bool], opts = NMOptions()
+): NMResult[K] =
+  ## Without bounds.
+  var lower, upper: array[K, float]
+  for j in 0 ..< K:
+    (lower[j], upper[j]) = (-Inf, Inf)
+  nelderMead(f, p0, free, lower, upper, opts)

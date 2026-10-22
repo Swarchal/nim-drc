@@ -4,7 +4,7 @@ Dose-response curve fitting for Nim, with no dependencies beyond the standard li
 
 - Three-, four- and five-parameter logistic fits (3PL, 4PL / Hill, 5PL)
 - Levenberg–Marquardt with multi-start, and a Nelder–Mead fallback
-- Zero-dose controls, fixed parameters and weighted fits
+- Zero-dose controls, fixed or bounded parameters and weighted fits
 - Robust fits (Huber, Tukey bisquare) that downweight or reject outliers
 - Standard errors, t-based confidence intervals, R², AIC/BIC
 - EC50 and any ECx (EC10, EC90, …) with confidence intervals
@@ -109,6 +109,62 @@ Hill = -0.89 ± 0.04
 
 Fixed parameters have a standard error of 0 and do not count towards the
 degrees of freedom. A 3PL with only Bottom fixed is `fitLL3(doses, viability)`.
+
+### Bounded parameters
+
+Bounds keep a parameter within a range, but let the data place it there.
+They suit partial curves, where an unconstrained plateau drifts past
+what is physically possible:
+
+```nim
+import std/strformat
+import drc
+
+let doses = [1e-9, 1e-9, 1e-8, 1e-8, 1e-7, 1e-7, 1e-6, 1e-6, 1e-5, 1e-5]   # molar
+let viability = [101.3, 97.8, 96.1, 99.0, 78.2, 74.9, 31.5, 36.0, 4.1, 1.2] # % of control
+
+let free = fitLL4(doses, viability)
+let fit = fitLL4(doses, viability, bounds = [(Bottom, 0.0 .. Inf), (Top, -Inf .. 100.0)])
+echo &"unbounded: Bottom {free.params[Bottom]:.2f}, Top {free.params[Top]:.2f}, IC50 {free.ec50 * 1e9:.1f} nM"
+echo &"bounded:   Bottom {fit.params[Bottom]:.2f}, Top {fit.params[Top]:.2f}, IC50 {fit.ec50 * 1e9:.1f} nM"
+echo "at a bound: ", fit.atBound
+echo fit.summary
+```
+
+```
+unbounded: Bottom -7.59, Top 101.36, IC50 517.7 nM
+bounded:   Bottom 0.00, Top 100.00, IC50 423.1 nM
+at a bound: {Bottom, Top}
+4PL fit to 10 observations
+
+              Estimate   Std.Error     Lower 95%     Upper 95%
+Bottom         0.00000     4.08586      -9.99773       9.99773  (at lower bound)
+Top            100.000     2.10550       94.8480       105.152  (at upper bound)
+LogEC50       -6.37355   0.0701354      -6.54517      -6.20194
+Hill         -0.878916    0.105150      -1.13621     -0.621623
+EC50       4.23106e-07               2.84993e-07   6.28152e-07
+
+Residual standard error: 3.26504 on 6 degrees of freedom
+R²: 0.995571   AIC: 56.9360   BIC: 58.4489
+Stopped after 9 iterations: relative change in SSR below ftol
+Warning: a parameter is at a bound; its standard error and interval ignore the bound
+```
+
+- **`bounds`** takes `(param, lower .. upper)` pairs, with `-Inf` or `Inf`
+  for a one-sided bound. A parameter can be fixed or bounded, not both.
+  `fitLL3`, `fitLL5`, the joint fits and robust fits all take `bounds`.
+  In a joint fit, a bound applies to every curve.
+- **A parameter that ends on a bound** is listed in `fit.atBound` and raises
+  `fwAtBound`. It still counts as free in `df` and AIC, and its standard
+  error is computed as if it were unbounded, as in R's
+  `nls(algorithm = "port")` and SciPy's `curve_fit`. Its interval can
+  therefore cross the bound, as Bottom's does here. A bound that binds also
+  means the data alone would put the parameter elsewhere, so the other
+  estimates (here the IC50) depend on that choice.
+- **The fit** is projected Levenberg–Marquardt: each trial point is clamped
+  into the bounds, and a parameter on a bound whose gradient points outwards
+  is held there for that step. The Nelder–Mead fallback clamps each vertex
+  into the bounds.
 
 ### Asymmetric curves (5PL)
 
@@ -394,10 +450,12 @@ warning: EC50 lies outside the tested dose range
 | `fwSingular` | the parameters are not identifiable (e.g. a flat response); standard errors are NaN |
 | `fwNoResidualDf` | as many free parameters as observations; standard errors are NaN |
 | `fwRobustNotConverged` | the robust reweighting hit `irlsMaxIter` without settling, or a refit failed |
+| `fwAtBound` | a parameter ended on one of its `bounds` (see `fit.atBound`) |
 
 Invalid input raises `ValueError`. This covers negative or non-finite doses,
 non-finite responses, mismatched lengths, too few observations, a non-positive
-Asymmetry, and confidence levels or percentages out of range.
+Asymmetry, bounds that are empty or on a fixed parameter, and confidence
+levels or percentages out of range.
 
 ### How fits are found
 
@@ -447,6 +505,11 @@ echo &"A = {r.params[0]:.3f}, k = {r.params[1]:.3f}, converged: {r.status.conver
 A = 10.070, k = 0.505, converged: true
 ```
 
+To keep parameters within bounds, pass `lower` and `upper` arrays after
+`free`, using `-Inf` and `Inf` for no bound:
+`levenbergMarquardt(expDecay, x, y, w, [5.0, 0.1], [true, true], [0.0, 0.0], [Inf, 0.4])`.
+`nelderMead` takes them in the same place.
+
 For the parameter covariance, build JᵀWJ at the solution with
 `normalEquations`, pass it to `unscaledCovariance`, and multiply by
 σ² = SSR / (n − k).
@@ -476,6 +539,10 @@ The tests compare against reference values from R:
 - **Robust fits:** `robustbase::nlrob` coefficients, scale and weights for
   Huber and Tukey fits of data with outliers. Standard errors are checked
   against `MASS::rlm`'s covariance formula, computed independently in R.
+- **Bounds:** `nls(algorithm = "port")` fits with bounds active on Bottom,
+  Top, Hill and 5PL Asymmetry, and on a joint fit's shared Top; a bounded
+  Huber fit against `nlrob(algorithm = "port")`; and SciPy's bounded
+  `curve_fit`.
 - **Joint fits:** `nls` fits with indexed parameters (e.g.
   `density ~ b + (t-b)/(1+10^((l[c]-x)*h))`) of R's DNase data and of
   simulated data: parallel and separate curves, weights and zero weights,

@@ -13,6 +13,9 @@ type
     model*: Model
     shared*: set[DrcParam] ## one value for all curves; includes the fixed parameters
     fixed*: set[DrcParam] ## includes Asymmetry (= 1) for 3PL and 4PL fits
+    lower*, upper*: array[DrcParam, float]
+      ## the bounds on each parameter, for every curve: −Inf and Inf when unbounded
+    atBound*: set[DrcParam] ## free parameters that ended on a bound in any curve
     curves*: seq[DrcFit] ## each curve as a single fit (see `fitLL4Multi`)
     index*: seq[array[DrcParam, int]]
       ## index[c][param]: slot of curve c's parameter in `params`
@@ -73,6 +76,7 @@ proc fitMulti(
     shared: set[DrcParam],
     weights: openArray[float],
     fixed: openArray[(DrcParam, float)],
+    bounds: openArray[(DrcParam, Slice[float])],
     opts: FitOptions,
 ): MultiFit =
   if opts.loss != Squared:
@@ -88,6 +92,10 @@ proc fitMulti(
   result.model = model
   result.fixed = fixedParams
   result.shared = shared + fixedParams
+  let box = resolveBounds(model, fixedParams, bounds)
+  for param in DrcParam:
+    result.lower[param] = box.lower[ord(param)]
+    result.upper[param] = box.upper[ord(param)]
   result.fixedValues = fixedValues
   result.curveIds = @curve
 
@@ -123,17 +131,17 @@ proc fitMulti(
 
   # Layout of the joint vector; fixed slots hold their value from the start.
   result.index = newSeq[array[DrcParam, int]](m)
+  var lower, upper: seq[float] # bounds on each slot
   for param in DrcParam:
-    if param in result.shared:
+    let copies = if param in result.shared: 1 else: m
+    for k in 0 ..< copies:
       for c in 0 ..< m:
-        result.index[c][param] = result.params.len
+        if copies == 1 or c == k:
+          result.index[c][param] = result.params.len
       result.params.add fixedValues[ord(param)]
       result.free.add param notin fixedParams
-    else:
-      for c in 0 ..< m:
-        result.index[c][param] = result.params.len
-        result.params.add 0.0
-        result.free.add true
+      lower.add box.lower[ord(param)]
+      upper.add box.upper[ord(param)]
   var nFree = 0
   for f in result.free:
     if f:
@@ -172,12 +180,14 @@ proc fitMulti(
           gy.add responses[i]
     var ok = false
     if nCurve[c] >= max(curveFree, 1):
-      single[c] = fitCurve(model, dc, rc, wc, fixed, singleOpts).params.toVec
+      single[c] = fitCurve(model, dc, rc, wc, fixed, bounds, singleOpts).params.toVec
       ok = true
       for v in single[c]:
         ok = ok and v.isFinite
     if not ok:
       single[c] = drcGuess(gx, gy, fixedValues, fixedParams)
+      for j in 0 ..< drcParamCount:
+        single[c][j] = clamp(single[c][j], box.lower[j], box.upper[j])
 
   var startA = result.params
   for param in DrcParam:
@@ -187,14 +197,15 @@ proc fitMulti(
       var values: seq[float]
       for c in 0 ..< m:
         values.add single[c][ord(param)]
-      startA[result.index[0][param]] = sharedStart(param, values)
+      startA[result.index[0][param]] =
+        clamp(sharedStart(param, values), box.lower[ord(param)], box.upper[ord(param)])
     else:
       for c in 0 ..< m:
         startA[result.index[c][param]] = single[c][ord(param)]
   var starts = @[startA]
   if shared - fixedParams != {} and result.n >= max(curveFree, 1):
     # The pooled curve is a good guess for the shared parameters.
-    let pooled = fitCurve(model, doses, responses, w, fixed, singleOpts).params
+    let pooled = fitCurve(model, doses, responses, w, fixed, bounds, singleOpts).params
     var startB = startA
     for param in shared - fixedParams:
       if pooled[param].isFinite:
@@ -244,7 +255,7 @@ proc fitMulti(
 
   proc search(starts: seq[seq[float]], free: seq[bool]): LMDynResult =
     for k, start in starts:
-      let r = levenbergMarquardt(joint, obs, ys, w, start, free, opts.lm)
+      let r = levenbergMarquardt(joint, obs, ys, w, start, free, lower, upper, opts.lm)
       if k == 0 or r.better(result):
         result = r
 
@@ -257,7 +268,8 @@ proc fitMulti(
       symFree[result.index[c][Asymmetry]] = false
     for s in symStarts.mitems:
       for c in 0 ..< m:
-        s[result.index[c][Asymmetry]] = 1.0
+        s[result.index[c][Asymmetry]] =
+          clamp(1.0, box.lower[ord(Asymmetry)], box.upper[ord(Asymmetry)])
     best = search(symStarts, symFree)
     let released = search(@[best.params, startA], result.free)
     if released.better(best):
@@ -271,8 +283,16 @@ proc fitMulti(
   result.converged = best.status.converged
   if not result.converged:
     result.warnings.incl fwNotConverged
+  for c in 0 ..< m:
+    for param in DrcParam:
+      let slot = result.index[c][param]
+      if result.free[slot] and result.params[slot] in [lower[slot], upper[slot]]:
+        result.atBound.incl param
+  if result.atBound != {}:
+    result.warnings.incl fwAtBound
 
-  # Uncertainty, as for a single curve, over the joint vector.
+  # Uncertainty, as for a single curve, over the joint vector, with parameters
+  # at a bound counted as free (as R's nls with algorithm = "port").
   var
     jtwj, unscaled: seq[seq[float]]
     gradient: seq[float]
@@ -311,6 +331,7 @@ proc fitMulti(
     var v: DrcFit
     v.model = model
     v.fixed = fixedParams
+    (v.lower, v.upper) = (result.lower, result.upper)
     v.loss = Squared
     for param in DrcParam:
       v.params[param] = result.params[index[c][param]]
@@ -348,7 +369,12 @@ proc fitMulti(
     v.converged = result.converged
     v.iterations = result.iterations
     v.status = result.status
-    v.warnings = result.warnings
+    v.warnings = result.warnings - {fwAtBound}
+    for param in DrcParam:
+      if param notin fixedParams and v.params[param] in [v.lower[param], v.upper[param]]:
+        v.atBound.incl param
+    if v.atBound != {}:
+      v.warnings.incl fwAtBound
     let logEC50 = log10(v.ec50)
     if not (logEC50 >= v.logDoseRange.lower and logEC50 <= v.logDoseRange.upper):
       v.warnings.incl fwEc50OutsideRange
@@ -361,6 +387,7 @@ proc fitLL4Multi*(
     shared: set[DrcParam] = {},
     weights: openArray[float] = [],
     fixed: openArray[(DrcParam, float)] = [],
+    bounds: openArray[(DrcParam, Slice[float])] = [],
     opts = FitOptions(),
 ): MultiFit =
   ## Fits four-parameter logistics to several curves at once. Observation i
@@ -368,13 +395,14 @@ proc fitLL4Multi*(
   ## `shared` take one value for all curves; the rest are fitted per curve.
   ## For example, `shared = {Bottom, Top, Hill}` fits parallel curves that
   ## differ only in EC50. Parameters in `fixed` are held at one value for all
-  ## curves.
+  ## curves, and those in `bounds` (as for `fitLL4`) are kept within one
+  ## range for all curves.
   ##
   ## `fit.curves[c]` is curve c as a `DrcFit`, so `ec50`, `ecxCI`, `predict`
   ## and the bands work on it. Its covariance is curve c's block of the joint
   ## covariance, and its `df` and `sigma` are the joint fit's; its `ssr`,
   ## `rSquared` and `n` are its own. Only least squares is supported.
-  fitMulti(LL4, doses, responses, curve, shared, weights, fixed, opts)
+  fitMulti(LL4, doses, responses, curve, shared, weights, fixed, bounds, opts)
 
 proc fitLL3Multi*(
     doses, responses: openArray[float],
@@ -382,10 +410,13 @@ proc fitLL3Multi*(
     shared: set[DrcParam] = {},
     weights: openArray[float] = [],
     bottom = 0.0,
+    bounds: openArray[(DrcParam, Slice[float])] = [],
     opts = FitOptions(),
 ): MultiFit =
   ## As `fitLL4Multi`, with Bottom fixed at `bottom` for every curve.
-  fitMulti(LL3, doses, responses, curve, shared, weights, [(Bottom, bottom)], opts)
+  fitMulti(
+    LL3, doses, responses, curve, shared, weights, [(Bottom, bottom)], bounds, opts
+  )
 
 proc fitLL5Multi*(
     doses, responses: openArray[float],
@@ -393,10 +424,11 @@ proc fitLL5Multi*(
     shared: set[DrcParam] = {},
     weights: openArray[float] = [],
     fixed: openArray[(DrcParam, float)] = [],
+    bounds: openArray[(DrcParam, Slice[float])] = [],
     opts = FitOptions(),
 ): MultiFit =
   ## As `fitLL4Multi` for five-parameter logistics.
-  fitMulti(LL5, doses, responses, curve, shared, weights, fixed, opts)
+  fitMulti(LL5, doses, responses, curve, shared, weights, fixed, bounds, opts)
 
 proc relativePotency*(
     fit: MultiFit, a, b: int, pct = 50.0, level = 0.95
@@ -484,7 +516,8 @@ proc summary*(fit: MultiFit, level = 0.95): string =
         result.add &"{name:<12}{value:>12.6g}{\"(fixed)\":>12}\n"
       else:
         let se = sqrt(fit.cov[slot][slot])
-        result.add &"{name:<12}{value:>12.6g}{se:>12.6g}{value - tq * se:>14.6g}{value + tq * se:>14.6g}\n"
+        result.add &"{name:<12}{value:>12.6g}{se:>12.6g}{value - tq * se:>14.6g}{value + tq * se:>14.6g}"
+        result.add fit.curves[c].boundNote(param) & "\n"
   for c, curve in fit.curves:
     let ci = curve.ecxInterval(50.0, tq)
     result.add &"""{"EC50[" & $c & "]":<12}{curve.ec50:>12.6g}{"":>12}{ci.lower:>14.6g}{ci.upper:>14.6g}""" &
