@@ -6,8 +6,9 @@ import std/math
 type
   NMOptions* = object
     maxEval*: int = 5000
-    ftol*: float = 1e-12  ## stop when the spread of values over the simplex is below ftol · |best|
-    xtol*: float = 1e-8   ## ...and each vertex is within xtol (relative) of the best one
+    ftol*: float = 1e-12
+      ## stop when the spread of values over the simplex is below ftol · |best|
+    xtol*: float = 1e-8 ## ...and each vertex is within xtol (relative) of the best one
 
   NMResult*[K: static int] = object
     params*: array[K, float]
@@ -15,13 +16,15 @@ type
     evaluations*: int
     converged*: bool
 
-proc nelderMead*[K: static int; F](f: F; p0: array[K, float]; free: array[K, bool];
-                                   opts = NMOptions()): NMResult[K] =
+proc nelderMead*[K: static int, F](
+    f: F, p0: array[K, float], free: array[K, bool], opts = NMOptions()
+): NMResult[K] =
   ## Minimises `f(p: array[K, float]): float` over the parameters marked in
   ## `free`, holding the others at their value in `p0`. NaN values count as +Inf.
   var idx: seq[int]
   for j in 0 ..< K:
-    if free[j]: idx.add j
+    if free[j]:
+      idx.add j
   let m = idx.len
 
   template eval(p: array[K, float]): float =
@@ -47,10 +50,11 @@ proc nelderMead*[K: static int; F](f: F; p0: array[K, float]; free: array[K, boo
       simplex[i][j] += (if p0[j] != 0.0: 0.1 * abs(p0[j]) else: 0.1)
     values[i] = eval(simplex[i])
 
-  proc along(a, b: array[K, float]; t: float): array[K, float] =
+  proc along(a, b: array[K, float], t: float): array[K, float] =
     ## a + t · (b − a) on the free coordinates.
     result = a
-    for j in idx: result[j] = a[j] + t * (b[j] - a[j])
+    for j in idx:
+      result[j] = a[j] + t * (b[j] - a[j])
 
   while true:
     # Order the vertices: best first, worst last.
@@ -64,7 +68,8 @@ proc nelderMead*[K: static int; F](f: F; p0: array[K, float]; free: array[K, boo
     var small = values[m] - values[0] <= opts.ftol * abs(values[0])
     for i in 1 .. m:
       for j in idx:
-        if abs(simplex[i][j] - simplex[0][j]) > opts.xtol * (abs(simplex[0][j]) + opts.xtol):
+        if abs(simplex[i][j] - simplex[0][j]) >
+            opts.xtol * (abs(simplex[0][j]) + opts.xtol):
           small = false
     if small:
       result.converged = true
@@ -75,7 +80,8 @@ proc nelderMead*[K: static int; F](f: F; p0: array[K, float]; free: array[K, boo
     var centroid = simplex[0]
     for j in idx:
       var total = 0.0
-      for i in 0 ..< m: total += simplex[i][j]
+      for i in 0 ..< m:
+        total += simplex[i][j]
       centroid[j] = total / float(m)
 
     let
@@ -84,13 +90,19 @@ proc nelderMead*[K: static int; F](f: F; p0: array[K, float]; free: array[K, boo
     if fr < values[0]:
       let expanded = along(centroid, simplex[m], -2.0)
       let fe = eval(expanded)
-      if fe < fr: (simplex[m], values[m]) = (expanded, fe)
-      else: (simplex[m], values[m]) = (reflected, fr)
+      if fe < fr:
+        (simplex[m], values[m]) = (expanded, fe)
+      else:
+        (simplex[m], values[m]) = (reflected, fr)
     elif fr < values[m - 1]:
       (simplex[m], values[m]) = (reflected, fr)
     else:
       # Contract towards the better of the reflected and worst points.
-      let (target, ft) = if fr < values[m]: (reflected, fr) else: (simplex[m], values[m])
+      let (target, ft) =
+        if fr < values[m]:
+          (reflected, fr)
+        else:
+          (simplex[m], values[m])
       let contracted = along(centroid, target, 0.5)
       let fc = eval(contracted)
       if fc < ft:

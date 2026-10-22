@@ -6,9 +6,10 @@ import ryegrass
 # gradients, f ± qt(0.975, df)·sqrt(v) (confidence) and f ± qt·sqrt(v + σ²/w)
 # (prediction). The 5PL data are those in tmodelfits.
 
-proc close(a, b: float; rel = 1e-5): bool = abs(a - b) <= rel * max(1e-3, abs(b))
+proc close(a, b: float, rel = 1e-5): bool =
+  abs(a - b) <= rel * max(1e-3, abs(b))
 
-proc checkBand(b: Band; fit, lower, upper: float) =
+proc checkBand(b: Band, fit, lower, upper: float) =
   check close(b.fit, fit, 1e-7)
   check close(b.lower, lower)
   check close(b.upper, upper)
@@ -33,8 +34,12 @@ suite "bands: ryegrass 4PL":
     checkBand(b[4], 0.48316729343851883, -0.68462300974080337, 1.6509575966178409)
 
   test "a heavier prediction weight narrows only the noise term":
-    checkBand(fit.predictionBand(3.0, weight = 4.0),
-              4.2414615880532471, 3.4539985168648957, 5.028924659241599)
+    checkBand(
+      fit.predictionBand(3.0, weight = 4.0),
+      4.2414615880532471,
+      3.4539985168648957,
+      5.028924659241599,
+    )
 
   test "at zero dose the confidence band is the plateau's interval":
     let b = fit.confidenceBand(0.0)
@@ -47,22 +52,30 @@ suite "bands: ryegrass 4PL":
     check fit.predictionBand(3.0) == fit.predictionBand([3.0])[0]
 
   test "invalid arguments are rejected":
-    expect ValueError: discard fit.confidenceBand(-1.0)
-    expect ValueError: discard fit.confidenceBand(Inf)
-    expect ValueError: discard fit.predictionBand(1.0, weight = 0.0)
-    expect ValueError: discard fit.confidenceBand(1.0, level = 1.0)
+    expect ValueError:
+      discard fit.confidenceBand(-1.0)
+    expect ValueError:
+      discard fit.confidenceBand(Inf)
+    expect ValueError:
+      discard fit.predictionBand(1.0, weight = 0.0)
+    expect ValueError:
+      discard fit.confidenceBand(1.0, level = 1.0)
 
 suite "bands: 5PL":
   const
-    dose = [0.0, 0.0, 1e-09, 1e-09, 3.1622776601683795e-09, 3.1622776601683795e-09,
-            1e-08, 1e-08, 3.162277660168379e-08, 3.162277660168379e-08, 1e-07, 1e-07,
-            3.162277660168379e-07, 3.162277660168379e-07, 1e-06, 1e-06,
-            3.162277660168379e-06, 3.162277660168379e-06, 1e-05, 1e-05,
-            3.1622776601683795e-05, 3.1622776601683795e-05, 0.0001, 0.0001,
-            0.00031622776601683794, 0.00031622776601683794, 0.001, 0.001]
-    response = [5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38, 37.01, 36.75,
-                54.87, 52.8, 75.55, 77.0, 86.17, 87.94, 89.67, 90.89, 90.97, 94.18, 92.39,
-                95.46, 95.3, 94.61, 89.96, 93.92]
+    dose = [
+      0.0, 0.0, 1e-09, 1e-09, 3.1622776601683795e-09, 3.1622776601683795e-09, 1e-08,
+      1e-08, 3.162277660168379e-08, 3.162277660168379e-08, 1e-07, 1e-07,
+      3.162277660168379e-07, 3.162277660168379e-07, 1e-06, 1e-06, 3.162277660168379e-06,
+      3.162277660168379e-06, 1e-05, 1e-05, 3.1622776601683795e-05,
+      3.1622776601683795e-05, 0.0001, 0.0001, 0.00031622776601683794,
+      0.00031622776601683794, 0.001, 0.001,
+    ]
+    response = [
+      5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38, 37.01, 36.75, 54.87,
+      52.8, 75.55, 77.0, 86.17, 87.94, 89.67, 90.89, 90.97, 94.18, 92.39, 95.46, 95.3,
+      94.61, 89.96, 93.92,
+    ]
   let fit = fitLL5(dose, response)
 
   test "confidence and prediction bands match R":

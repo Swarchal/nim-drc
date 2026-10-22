@@ -5,9 +5,12 @@
 import std/[algorithm, math, stats]
 import linalg
 
-type
-  DrcParam* = enum
-    Bottom, Top, LogEC50, Hill, Asymmetry
+type DrcParam* = enum
+  Bottom
+  Top
+  LogEC50
+  Hill
+  Asymmetry
 
 const drcParamCount* = ord(high(DrcParam)) + 1
 
@@ -26,7 +29,9 @@ func logistic(u: float): tuple[s, sc, lnS: float] =
     let e = exp(u)
     (1.0 / (1.0 + e), e / (1.0 + e), -log1p(e))
 
-proc ll5*(x: float; p: array[drcParamCount, float]; grad: var array[drcParamCount, float]): float {.nimcall.} =
+proc ll5*(
+    x: float, p: array[drcParamCount, float], grad: var array[drcParamCount, float]
+): float {.nimcall.} =
   ## Five-parameter logistic:
   ##   f(x) = Bottom + (Top − Bottom) / (1 + 10^((LogEC50 − x) · Hill))^Asymmetry
   ## With Asymmetry = 1 this is the four-parameter logistic (Hill equation),
@@ -60,19 +65,30 @@ proc ll5*(x: float; p: array[drcParamCount, float]; grad: var array[drcParamCoun
   # (LogEC50 − x) · Hill would be ∞ · 0).
   let
     zeroDose = x == NegInf
-    (_, sc, lnS) = logistic(if zeroDose: 0.0 else: ln10 * (l - x) * h)
-    sa = exp(a * lnS)                    # sᴬ, the fraction of the way to Top
-    dfdz = -(t - b) * a * sa * sc * ln10  # ∂f/∂z with z = (LogEC50 − x) · Hill
-  grad[ord(Bottom)] = -expm1(a * lnS)    # 1 − sᴬ
+    (_, sc, lnS) = logistic(
+      if zeroDose:
+        0.0
+      else:
+        ln10 * (l - x) * h
+    )
+    sa = exp(a * lnS) # sᴬ, the fraction of the way to Top
+    dfdz = -(t - b) * a * sa * sc * ln10 # ∂f/∂z with z = (LogEC50 − x) · Hill
+  grad[ord(Bottom)] = -expm1(a * lnS) # 1 − sᴬ
   grad[ord(Top)] = sa
   grad[ord(LogEC50)] = dfdz * h
-  grad[ord(Hill)] = if zeroDose: 0.0 else: dfdz * (l - x)
+  grad[ord(Hill)] =
+    if zeroDose:
+      0.0
+    else:
+      dfdz * (l - x)
   grad[ord(Asymmetry)] = (t - b) * sa * lnS
   b + (t - b) * sa
 
-proc drcGuess*(x, y: openArray[float];
-               fixedValues: array[drcParamCount, float] = default(array[drcParamCount, float]);
-               fixed: set[DrcParam] = {}): array[drcParamCount, float] =
+proc drcGuess*(
+    x, y: openArray[float],
+    fixedValues: array[drcParamCount, float] = default(array[drcParamCount, float]),
+    fixed: set[DrcParam] = {},
+): array[drcParamCount, float] =
   ## Starting values for a fit, using parameters in `fixed` as given. The
   ## curve is assumed symmetric (Asymmetry = 1) unless Asymmetry is fixed.
   ##
@@ -84,7 +100,8 @@ proc drcGuess*(x, y: openArray[float];
 
   # Mean response for each distinct dose, ordered by dose.
   var points = newSeq[(float, float)](x.len)
-  for i in 0 ..< x.len: points[i] = (x[i], y[i])
+  for i in 0 ..< x.len:
+    points[i] = (x[i], y[i])
   points.sort()
   var gx, gy: seq[float]
   var i = 0
@@ -100,8 +117,10 @@ proc drcGuess*(x, y: openArray[float];
 
   var b = min(gy)
   var t = max(gy)
-  if Bottom in fixed: b = fixedValues[ord(Bottom)]
-  if Top in fixed: t = fixedValues[ord(Top)]
+  if Bottom in fixed:
+    b = fixedValues[ord(Bottom)]
+  if Top in fixed:
+    t = fixedValues[ord(Top)]
 
   # Only finite doses carry information about position and slope.
   var fx, fy: seq[float]
@@ -122,7 +141,11 @@ proc drcGuess*(x, y: openArray[float];
       l = fx[k] + (mid - y0) * (fx[k + 1] - fx[k]) / (y1 - y0)
       break
   if l.isNaN:
-    l = if fx.len > 0: 0.5 * (fx[0] + fx[^1]) else: 0.0
+    l =
+      if fx.len > 0:
+        0.5 * (fx[0] + fx[^1])
+      else:
+        0.0
 
   var h = direction
   if t != b:

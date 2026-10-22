@@ -3,7 +3,7 @@ import drc/[linalg, models]
 
 type P = array[drcParamCount, float]
 
-proc checkGradient(x: float; p: P) =
+proc checkGradient(x: float, p: P) =
   ## Compares the analytic gradient against central finite differences.
   var grad, scratch: P
   discard ll5(x, p, grad)
@@ -24,7 +24,8 @@ suite "logistic model":
 
   test "5PL value at LogEC50 is Bottom + (Top − Bottom) / 2^Asymmetry":
     var grad: P
-    check abs(ll5(0.5, [1.0, 9.0, 0.5, 1.3, 0.4], grad) - (1.0 + 8.0 / pow(2.0, 0.4))) < 1e-12
+    check abs(ll5(0.5, [1.0, 9.0, 0.5, 1.3, 0.4], grad) - (1.0 + 8.0 / pow(2.0, 0.4))) <
+      1e-12
 
   test "plateaus and direction":
     var grad: P
@@ -41,7 +42,8 @@ suite "logistic model":
       for h in [-50.0, 50.0]:
         for a in [0.2, 1.0, 5.0]:
           check ll5(x, [1.0, 9.0, 0.0, h, a], grad).isFinite
-          for g in grad: check g.isFinite
+          for g in grad:
+            check g.isFinite
 
   test "zero dose gives the low-dose plateau":
     var grad: P
@@ -56,7 +58,8 @@ suite "logistic model":
     check abs(f - (1.0 + 8.0 * pow(0.5, 0.5))) < 1e-12
     var flat: P
     check abs(f - ll5(2.0, [1.0, 9.0, 0.3, 0.0, 0.5], flat)) < 1e-12
-    for g in grad: check g.isFinite
+    for g in grad:
+      check g.isFinite
 
   test "non-positive asymmetry is rejected with NaN":
     var grad: P
@@ -64,8 +67,13 @@ suite "logistic model":
     check ll5(0.0, [1.0, 9.0, 0.0, 1.0, -1.0], grad).isNaN
 
   test "analytic gradient matches finite differences":
-    for p in [[0.0, 100.0, -6.5, 1.0, 1.0], [0.48, 7.79, 0.485, -2.98, 1.0],
-              [10.0, -3.0, 2.0, 0.4, 1.0], [5.0, 95.0, -6.0, 1.3, 0.35], [5.0, 95.0, -6.0, -0.8, 2.5]]:
+    for p in [
+      [0.0, 100.0, -6.5, 1.0, 1.0],
+      [0.48, 7.79, 0.485, -2.98, 1.0],
+      [10.0, -3.0, 2.0, 0.4, 1.0],
+      [5.0, 95.0, -6.0, 1.3, 0.35],
+      [5.0, 95.0, -6.0, -0.8, 2.5],
+    ]:
       for x in [-9.0, -6.5, -6.0, -1.0, 0.0, 0.485, 1.5, 3.0]:
         checkGradient(x, p)
 
@@ -84,8 +92,12 @@ suite "initial guess":
     check g[ord(Asymmetry)] == 1.0
 
   test "fixed parameters are respected":
-    let g = drcGuess([0.0, 1.0, 2.0, 3.0], [1.0, 2.0, 8.0, 9.0],
-                     [0.0, 10.0, 0.0, 0.0, 0.5], {Bottom, Top, Asymmetry})
+    let g = drcGuess(
+      [0.0, 1.0, 2.0, 3.0],
+      [1.0, 2.0, 8.0, 9.0],
+      [0.0, 10.0, 0.0, 0.0, 0.5],
+      {Bottom, Top, Asymmetry},
+    )
     check g[ord(Bottom)] == 0.0
     check g[ord(Top)] == 10.0
     check g[ord(Hill)] > 0.0

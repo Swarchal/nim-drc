@@ -6,9 +6,10 @@ import ryegrass
 # BIC(), and t-based Wald intervals est ± qt(0.975, df) · se. ECx intervals use
 # the delta method on log10(ECx) with vcov() from the same fit.
 
-proc close(a, b: float; rel = 1e-5): bool = abs(a - b) <= rel * max(1e-3, abs(b))
+proc close(a, b: float, rel = 1e-5): bool =
+  abs(a - b) <= rel * max(1e-3, abs(b))
 
-proc checkInterval(ci: ConfInt; lower, upper: float) =
+proc checkInterval(ci: ConfInt, lower, upper: float) =
   check close(ci.lower, lower)
   check close(ci.upper, upper)
 
@@ -61,15 +62,21 @@ suite "inference: ryegrass, all observations":
     check fit.warnings == {}
 
   test "invalid levels and percentages are rejected":
-    expect ValueError: discard fit.confint(Hill, 1.0)
-    expect ValueError: discard fit.confint(Hill, 0.0)
-    expect ValueError: discard fit.ecx(0.0)
-    expect ValueError: discard fit.ecxCI(100.0)
+    expect ValueError:
+      discard fit.confint(Hill, 1.0)
+    expect ValueError:
+      discard fit.confint(Hill, 0.0)
+    expect ValueError:
+      discard fit.ecx(0.0)
+    expect ValueError:
+      discard fit.ecxCI(100.0)
 
   test "summary lists parameters and EC50":
     let text = fit.summary
-    for word in ["4PL fit to 24 observations", "Bottom", "Top", "LogEC50", "Hill", "EC50",
-                 "20 degrees of freedom"]:
+    for word in [
+      "4PL fit to 24 observations", "Bottom", "Top", "LogEC50", "Hill", "EC50",
+      "20 degrees of freedom",
+    ]:
       check word in text
     check "Asymmetry" notin text
 
@@ -97,7 +104,8 @@ suite "inference: ryegrass, bottom fixed at zero":
 
 suite "inference: ryegrass, weighted":
   var weights: seq[float]
-  for i in 0 ..< 8: weights.add [1.0, 2.0, 0.5]
+  for i in 0 ..< 8:
+    weights.add [1.0, 2.0, 0.5]
   let fit = fitLL4(ryegrassDose, ryegrassRootLength, weights)
 
   test "matches weighted R nls":
@@ -150,6 +158,9 @@ suite "inference: warnings":
     check fit.confint(Hill).lower.isNaN
 
   test "flat response is not identifiable":
-    let fit = fitLL4([0.1, 1.0, 10.0, 100.0, 0.1, 1.0, 10.0, 100.0], [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0])
+    let fit = fitLL4(
+      [0.1, 1.0, 10.0, 100.0, 0.1, 1.0, 10.0, 100.0],
+      [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+    )
     check fwSingular in fit.warnings
     check fit.se[LogEC50].isNaN

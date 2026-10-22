@@ -24,15 +24,15 @@ import plotter
 const
   width = 520
   height = 320
-  pngScale = 2.0     # render at twice the size, for high-DPI screens
+  pngScale = 2.0 # render at twice the size, for high-DPI screens
   # The first three categorical slots, which stay distinguishable under
   # colour-vision deficiency even when every pair is on screen at once.
   blue = "#2a78d6"
   orange = "#eb6834"
   aqua = "#1baf7a"
-  ink = "#52514e"    # observations and annotations
-  muted = "#9a9893"  # reference lines
-  dotSize = 40       # area in px², as Vega-Lite measures point size
+  ink = "#52514e" # observations and annotations
+  muted = "#9a9893" # reference lines
+  dotSize = 40 # area in px², as Vega-Lite measures point size
 
 # ------------------------------------------------------------- dose axis ----
 
@@ -44,10 +44,10 @@ type DoseAxis = object
   lo, hi: float
   fittedToDisplay: float
 
-proc doseAxis(title: string; lo, hi: float; fittedToDisplay = 1.0): DoseAxis =
+proc doseAxis(title: string, lo, hi: float, fittedToDisplay = 1.0): DoseAxis =
   DoseAxis(title: title, lo: lo, hi: hi, fittedToDisplay: fittedToDisplay)
 
-proc toDisplay(a: DoseAxis; fittedDose: float): float =
+proc toDisplay(a: DoseAxis, fittedDose: float): float =
   fittedDose * a.fittedToDisplay
 
 proc x(a: DoseAxis): Encoding =
@@ -59,10 +59,11 @@ proc x(a: DoseAxis): Encoding =
   var ticks: seq[Value]
   for e in firstDecade .. lastDecade:
     ticks.add v(pow(10.0, float(e)))
-  "dose:Q".scale(scaleType = scLog, domain = @[v(a.lo), v(a.hi)], nice = false)
-    .axis(title = a.title, grid = false, values = ticks, format = "~g")
+  "dose:Q".scale(scaleType = scLog, domain = @[v(a.lo), v(a.hi)], nice = false).axis(
+    title = a.title, grid = false, values = ticks, format = "~g"
+  )
 
-proc doseGrid(a: DoseAxis; n = 200): seq[float] =
+proc doseGrid(a: DoseAxis, n = 200): seq[float] =
   ## n doses across the whole axis, evenly spaced in log10. They are in
   ## *fitted* units, ready to pass to `predict` or a band.
   let lo = log10(a.lo / a.fittedToDisplay)
@@ -72,15 +73,14 @@ proc doseGrid(a: DoseAxis; n = 200): seq[float] =
 
 # ----------------------------------------------------------- data frames ----
 
-type Series = object
-  ## A fitted curve and its legend label.
+type Series = object ## A fitted curve and its legend label.
   label: string
   fit: DrcFit
 
-proc series(label: string; fit: DrcFit): Series =
+proc series(label: string, fit: DrcFit): Series =
   Series(label: label, fit: fit)
 
-proc curveFrame(a: DoseAxis; curves: openArray[Series]): DataFrame =
+proc curveFrame(a: DoseAxis, curves: openArray[Series]): DataFrame =
   ## Each curve's predicted response across the axis, one row per point, with
   ## the curves stacked one after another.
   var dose, response: seq[float]
@@ -92,9 +92,12 @@ proc curveFrame(a: DoseAxis; curves: openArray[Series]): DataFrame =
       label.add curve.label
   dataFrame(col("dose", dose), col("response", response), col("series", label))
 
-proc observationFrame(a: DoseAxis; doses, responses: openArray[float];
-                      labels: openArray[string] = [];
-                      keep: openArray[bool] = []): DataFrame =
+proc observationFrame(
+    a: DoseAxis,
+    doses, responses: openArray[float],
+    labels: openArray[string] = [],
+    keep: openArray[bool] = [],
+): DataFrame =
   ## The observations to plot, one row each. `labels` gives each observation's
   ## series (default: none), and `keep` selects which observations to include
   ## (default: all). Zero doses cannot sit on a log axis, so they are always
@@ -111,41 +114,49 @@ proc observationFrame(a: DoseAxis; doses, responses: openArray[float];
 
 # ---------------------------------------------------------------- layers ----
 
-proc seriesColors(labels, colors: openArray[string]; legendAt: string): Encoding =
+proc seriesColors(labels, colors: openArray[string], legendAt: string): Encoding =
   ## Colour by series, giving each label a fixed colour, so that a series keeps
   ## its colour wherever it appears. `legendAt` is a Vega-Lite legend `orient`.
-  "series:N".scale(domain = labels.mapIt(v(it)), range = colors.mapIt(v(it)))
-    .legend(title = "", orient = legendAt)
+  "series:N".scale(domain = labels.mapIt(v(it)), range = colors.mapIt(v(it))).legend(
+    title = "", orient = legendAt
+  )
 
-proc curveLines(a: DoseAxis; curves: openArray[Series]; yTitle: string;
-                color: Encoding): Chart =
+proc curveLines(
+    a: DoseAxis, curves: openArray[Series], yTitle: string, color: Encoding
+): Chart =
   ## One line per fitted curve. This layer also sets the y-axis title.
-  chart(a.curveFrame(curves))
-    .markLine(strokeWidth = 2)
-    .encode(x = a.x, y = "response:Q".title(yTitle), color = color)
+  chart(a.curveFrame(curves)).markLine(strokeWidth = 2).encode(
+    x = a.x, y = "response:Q".title(yTitle), color = color
+  )
 
-proc dots(a: DoseAxis; observations: DataFrame): Chart =
+proc dots(a: DoseAxis, observations: DataFrame): Chart =
   ## Observations as solid grey dots.
-  chart(observations)
-    .markPoint(filled = true, color = ink, size = dotSize)
-    .encode(x = a.x, y = "response:Q")
+  chart(observations).markPoint(filled = true, color = ink, size = dotSize).encode(
+    x = a.x, y = "response:Q"
+  )
 
-proc seriesDots(a: DoseAxis; observations: DataFrame; color: Encoding): Chart =
+proc seriesDots(a: DoseAxis, observations: DataFrame, color: Encoding): Chart =
   ## Observations as solid dots, coloured by series.
-  chart(observations)
-    .markPoint(filled = true, size = dotSize, opacity = 0.9)
-    .encode(x = a.x, y = "response:Q", color = color)
+  chart(observations).markPoint(filled = true, size = dotSize, opacity = 0.9).encode(
+    x = a.x, y = "response:Q", color = color
+  )
 
-proc crosses(a: DoseAxis; observations: DataFrame): Chart =
+proc crosses(a: DoseAxis, observations: DataFrame): Chart =
   ## Observations as open grey ×s, for points that a fit has rejected.
   chart(observations)
-    .markPoint(filled = false, color = ink, size = 90, strokeWidth = 1.5,
-               raw = %*{"shape": "cross", "angle": 45})
+    .markPoint(
+      filled = false,
+      color = ink,
+      size = 90,
+      strokeWidth = 1.5,
+      raw = %*{"shape": "cross", "angle": 45},
+    )
     .encode(x = a.x, y = "response:Q")
 
-proc finish(c: Chart; title: string): Chart =
+proc finish(c: Chart, title: string): Chart =
   ## The size, title and styling that every figure shares.
-  c.properties(width = width, height = height, title = title)
+  c
+    .properties(width = width, height = height, title = title)
     .configureBackground("#ffffff")
     .configureView(noStroke = true)
     .configureAxis(gridColor = "#eeeeee")
@@ -155,12 +166,15 @@ proc finish(c: Chart; title: string): Chart =
 proc ryegrassFigure(): Chart =
   ## README, "Fit a curve and print a summary".
   # Ryegrass root length vs ferulic acid concentration (mM), from the R drc package
-  let doses = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.94, 0.94, 0.94, 1.88, 1.88, 1.88,
-               3.75, 3.75, 3.75, 7.5, 7.5, 7.5, 15.0, 15.0, 15.0, 30.0, 30.0, 30.0]
-  let rootLength = [7.58, 8.0, 8.3285714, 7.25, 7.375, 7.9625,
-                    8.3555556, 6.9142857, 7.75, 6.8714286, 6.45, 5.9222222,
-                    1.925, 2.8857143, 4.2333333, 1.1875, 0.8571429, 1.0571429,
-                    0.6875, 0.525, 0.825, 0.25, 0.22, 0.44]
+  let doses = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.94, 0.94, 0.94, 1.88, 1.88, 1.88, 3.75, 3.75, 3.75,
+    7.5, 7.5, 7.5, 15.0, 15.0, 15.0, 30.0, 30.0, 30.0,
+  ]
+  let rootLength = [
+    7.58, 8.0, 8.3285714, 7.25, 7.375, 7.9625, 8.3555556, 6.9142857, 7.75, 6.8714286,
+    6.45, 5.9222222, 1.925, 2.8857143, 4.2333333, 1.1875, 0.8571429, 1.0571429, 0.6875,
+    0.525, 0.825, 0.25, 0.22, 0.44,
+  ]
   let fit = fitLL4(doses, rootLength)
 
   let axis = doseAxis("Ferulic acid (mM)", 0.5, 50.0)
@@ -170,73 +184,81 @@ proc ryegrassFigure(): Chart =
   let grid = axis.doseGrid
   let confidence = fit.confidenceBand(grid)
   let prediction = fit.predictionBand(grid)
-  let bands = dataFrame(col("dose", grid.mapIt(axis.toDisplay(it))),
-                        col("fitted", confidence.mapIt(it.fit)),
-                        col("confidenceLower", confidence.mapIt(it.lower)),
-                        col("confidenceUpper", confidence.mapIt(it.upper)),
-                        col("predictionLower", prediction.mapIt(it.lower)),
-                        col("predictionUpper", prediction.mapIt(it.upper)))
-  let ec50 = dataFrame(col("dose", @[axis.toDisplay(fit.ec50)]),
-                       col("label", @[&"EC50 = {fit.ec50:.2f} mM"]))
+  let bands = dataFrame(
+    col("dose", grid.mapIt(axis.toDisplay(it))),
+    col("fitted", confidence.mapIt(it.fit)),
+    col("confidenceLower", confidence.mapIt(it.lower)),
+    col("confidenceUpper", confidence.mapIt(it.upper)),
+    col("predictionLower", prediction.mapIt(it.lower)),
+    col("predictionUpper", prediction.mapIt(it.upper)),
+  )
+  let ec50 = dataFrame(
+    col("dose", @[axis.toDisplay(fit.ec50)]),
+    col("label", @[&"EC50 = {fit.ec50:.2f} mM"]),
+  )
 
-  let predictionArea = chart(bands)
-    .markArea(color = blue, opacity = 0.10)
-    .encode(x = axis.x, y = "predictionLower:Q".title("Root length (cm)"),
-            y2 = "predictionUpper:Q")
-  let confidenceArea = chart(bands)
-    .markArea(color = blue, opacity = 0.25)
-    .encode(x = axis.x, y = "confidenceLower:Q", y2 = "confidenceUpper:Q")
-  let fittedLine = chart(bands)
-    .markLine(color = blue, strokeWidth = 2)
-    .encode(x = axis.x, y = "fitted:Q")
-  let ec50Rule = chart(ec50)
-    .markRule(color = muted, strokeDash = @[4.0, 4.0])
-    .encode(x = axis.x)
+  let predictionArea = chart(bands).markArea(color = blue, opacity = 0.10).encode(
+      x = axis.x,
+      y = "predictionLower:Q".title("Root length (cm)"),
+      y2 = "predictionUpper:Q",
+    )
+  let confidenceArea = chart(bands).markArea(color = blue, opacity = 0.25).encode(
+      x = axis.x, y = "confidenceLower:Q", y2 = "confidenceUpper:Q"
+    )
+  let fittedLine = chart(bands).markLine(color = blue, strokeWidth = 2).encode(
+      x = axis.x, y = "fitted:Q"
+    )
+  let ec50Rule =
+    chart(ec50).markRule(color = muted, strokeDash = @[4.0, 4.0]).encode(x = axis.x)
   # With no y encoding the label sits at mid-height; dy lifts it near the top.
   let ec50Label = chart(ec50)
     .markText(align = "left", dx = 6, dy = -100, color = ink, fontSize = 12)
     .encode(x = axis.x, text = "label:N")
   let observations = axis.dots(axis.observationFrame(doses, rootLength))
 
-  layer(predictionArea, confidenceArea, fittedLine, ec50Rule, ec50Label,
-        observations)
+  layer(predictionArea, confidenceArea, fittedLine, ec50Rule, ec50Label, observations)
     .finish("4PL fit with 95% confidence and prediction bands")
 
 proc asymmetricFigure(): Chart =
   ## README, "Asymmetric curves (5PL)".
-  var doses = @[0.0, 0.0]                 # two untreated controls
-  for k in 0 .. 12:                       # 1 nM to 1 mM in half-log steps, duplicates
+  var doses = @[0.0, 0.0] # two untreated controls
+  for k in 0 .. 12: # 1 nM to 1 mM in half-log steps, duplicates
     let dose = pow(10.0, -9.0 + 0.5 * float(k))
     doses.add [dose, dose]
-  let responses = [5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38,
-                   37.01, 36.75, 54.87, 52.8, 75.55, 77.0, 86.17, 87.94, 89.67,
-                   90.89, 90.97, 94.18, 92.39, 95.46, 95.3, 94.61, 89.96, 93.92]
+  let responses = [
+    5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38, 37.01, 36.75, 54.87,
+    52.8, 75.55, 77.0, 86.17, 87.94, 89.67, 90.89, 90.97, 94.18, 92.39, 95.46, 95.3,
+    94.61, 89.96, 93.92,
+  ]
   let four = fitLL4(doses, responses)
   let five = fitLL5(doses, responses)
 
   let axis = doseAxis("Dose (µM)", 7e-4, 1.5e3, fittedToDisplay = 1e6)
 
-  let curves = [series(&"4PL (AIC {four.aic:.1f})", four),
-                series(&"5PL (AIC {five.aic:.1f})", five)]
-  let color = seriesColors(curves.mapIt(it.label), [orange, blue], legendAt = "top-left")
+  let curves = [
+    series(&"4PL (AIC {four.aic:.1f})", four), series(&"5PL (AIC {five.aic:.1f})", five)
+  ]
+  let color =
+    seriesColors(curves.mapIt(it.label), [orange, blue], legendAt = "top-left")
 
   let lines = axis.curveLines(curves, "Response (%)", color)
   let observations = axis.dots(axis.observationFrame(doses, responses))
 
-  layer(lines, observations)
-    .finish("An asymmetric curve: 4PL vs 5PL")
+  layer(lines, observations).finish("An asymmetric curve: 4PL vs 5PL")
 
 proc robustFigure(): Chart =
   ## README, "Robust fitting (outliers)".
   # % activity of an inhibitor, triplicates, with three wells gone wrong
-  let doses = [1e-9, 1e-9, 1e-9, 3.16e-9, 3.16e-9, 3.16e-9, 1e-8, 1e-8, 1e-8,
-               3.16e-8, 3.16e-8, 3.16e-8, 1e-7, 1e-7, 1e-7, 3.16e-7, 3.16e-7, 3.16e-7,
-               1e-6, 1e-6, 1e-6, 3.16e-6, 3.16e-6, 3.16e-6, 1e-5, 1e-5, 1e-5,
-               3.16e-5, 3.16e-5, 3.16e-5, 1e-4, 1e-4, 1e-4]
-  let activity = [104.03, 90.24, 99.16, 95.92, 136.26, 96.97, 90.44, 95.81, 93.91,
-                  102.27, 92.98, 91.24, 77.88, 76.72, 75.56, 48.83, 16.45, 49.28,
-                  24.15, 20.67, 21.35, 12.34, 9.33, 6.18, 2.95, 35.12, 9.3,
-                  1.57, 1.65, 5.39, -0.56, 1.22, 4.74]
+  let doses = [
+    1e-9, 1e-9, 1e-9, 3.16e-9, 3.16e-9, 3.16e-9, 1e-8, 1e-8, 1e-8, 3.16e-8, 3.16e-8,
+    3.16e-8, 1e-7, 1e-7, 1e-7, 3.16e-7, 3.16e-7, 3.16e-7, 1e-6, 1e-6, 1e-6, 3.16e-6,
+    3.16e-6, 3.16e-6, 1e-5, 1e-5, 1e-5, 3.16e-5, 3.16e-5, 3.16e-5, 1e-4, 1e-4, 1e-4,
+  ]
+  let activity = [
+    104.03, 90.24, 99.16, 95.92, 136.26, 96.97, 90.44, 95.81, 93.91, 102.27, 92.98,
+    91.24, 77.88, 76.72, 75.56, 48.83, 16.45, 49.28, 24.15, 20.67, 21.35, 12.34, 9.33,
+    6.18, 2.95, 35.12, 9.3, 1.57, 1.65, 5.39, -0.56, 1.22, 4.74,
+  ]
   var curves: seq[Series]
   for loss in [Squared, Huber, Tukey]:
     let fit = fitLL4(doses, activity, opts = FitOptions(loss: loss))
@@ -249,29 +271,30 @@ proc robustFigure(): Chart =
   let used = rejected.mapIt(not it)
 
   let axis = doseAxis("Inhibitor (nM)", 0.7, 1.5e5, fittedToDisplay = 1e9)
-  let color = seriesColors(curves.mapIt(it.label), [orange, aqua, blue],
-                           legendAt = "top-right")
+  let color =
+    seriesColors(curves.mapIt(it.label), [orange, aqua, blue], legendAt = "top-right")
 
   let lines = axis.curveLines(curves, "Activity (% of control)", color)
   let usedObservations = axis.dots(axis.observationFrame(doses, activity, keep = used))
-  let rejectedObservations = axis.crosses(axis.observationFrame(doses, activity,
-                                                                keep = rejected))
+  let rejectedObservations =
+    axis.crosses(axis.observationFrame(doses, activity, keep = rejected))
 
-  layer(lines, usedObservations, rejectedObservations)
-    .finish("Least squares vs robust fits (× = given weight 0 by Tukey)")
+  layer(lines, usedObservations, rejectedObservations).finish(
+    "Least squares vs robust fits (× = given weight 0 by Tukey)"
+  )
 
 proc multiFigure(): Chart =
   ## README, "Several curves: shared parameters and relative potency".
   # R's DNase assay, runs 1, 4 and 8: duplicate wells at eight concentrations
   let conc = [0.04882812, 0.1953125, 0.390625, 0.78125, 1.5625, 3.125, 6.25, 12.5]
-  let density = [0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374,
-                 0.614, 0.609, 1.019, 1.001, 1.334, 1.364, 1.73, 1.71,
-                 0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364, 0.36,
-                 0.62, 0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732,
-                 0.054, 0.054, 0.152, 0.148, 0.226, 0.222, 0.392, 0.383,
-                 0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724]
+  let density = [
+    0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374, 0.614, 0.609, 1.019, 1.001,
+    1.334, 1.364, 1.73, 1.71, 0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364, 0.36, 0.62,
+    0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732, 0.054, 0.054, 0.152, 0.148, 0.226,
+    0.222, 0.392, 0.383, 0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724,
+  ]
   var doses: seq[float]
-  var curve: seq[int]  # which curve each observation belongs to
+  var curve: seq[int] # which curve each observation belongs to
   for c in 0 .. 2:
     for d in conc:
       doses.add [d, d]
@@ -290,10 +313,10 @@ proc multiFigure(): Chart =
 
   let lines = axis.curveLines(curves, "Optical density", color)
   let observations = axis.seriesDots(
-    axis.observationFrame(doses, density, labels = runOfObservation), color)
+    axis.observationFrame(doses, density, labels = runOfObservation), color
+  )
 
-  layer(lines, observations)
-    .finish("Parallel 4PL curves (shared Bottom, Top and Hill)")
+  layer(lines, observations).finish("Parallel 4PL curves (shared Bottom, Top and Hill)")
 
 # ------------------------------------------------------------------ main ----
 
@@ -303,9 +326,11 @@ when isMainModule:
   let outDir = currentSourcePath().parentDir.parentDir / "docs" / "images"
   createDir(outDir)
   # In README order. Each name is the PNG that the README links to.
-  for (name, figure) in [("ryegrass", ryegrassFigure()),
-                         ("asymmetric", asymmetricFigure()),
-                         ("robust", robustFigure()),
-                         ("multi", multiFigure())]:
+  for (name, figure) in [
+    ("ryegrass", ryegrassFigure()),
+    ("asymmetric", asymmetricFigure()),
+    ("robust", robustFigure()),
+    ("multi", multiFigure()),
+  ]:
     figure.savePng(outDir / &"{name}.png", scale = pngScale)
     echo &"  {name}.png"

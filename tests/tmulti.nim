@@ -3,9 +3,10 @@ import drc
 import drc/linalg
 import ryegrass
 
-proc close(a, b: float; rel: float): bool = abs(a - b) <= rel * max(1e-3, abs(b))
+proc close(a, b: float, rel: float): bool =
+  abs(a - b) <= rel * max(1e-3, abs(b))
 
-proc near(a, b, se: float; k = 2e-5): bool =
+proc near(a, b, se: float, k = 2e-5): bool =
   ## Estimates agree to a small fraction of their standard error. Optimisers,
   ## R's nls included, stop short of the exact optimum by about this much
   ## along poorly determined directions (e.g. a Bottom near 0).
@@ -13,27 +14,32 @@ proc near(a, b, se: float; k = 2e-5): bool =
 
 # R's DNase data, runs 1, 4 and 8 (curves 0, 1, 2).
 const
-  dnaseConc = [0.04882812, 0.04882812, 0.1953125, 0.1953125, 0.390625, 0.390625, 0.78125,
-               0.78125, 1.5625, 1.5625, 3.125, 3.125, 6.25, 6.25, 12.5, 12.5]
-  dnaseDensity = [0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374, 0.614, 0.609, 1.019,
-                  1.001, 1.334, 1.364, 1.73, 1.71, 0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364,
-                  0.36, 0.62, 0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732, 0.054, 0.054,
-                  0.152, 0.148, 0.226, 0.222, 0.392, 0.383, 0.658, 0.644, 1.043, 1.002, 1.466,
-                  1.381, 1.743, 1.724]
+  dnaseConc = [
+    0.04882812, 0.04882812, 0.1953125, 0.1953125, 0.390625, 0.390625, 0.78125, 0.78125,
+    1.5625, 1.5625, 3.125, 3.125, 6.25, 6.25, 12.5, 12.5,
+  ]
+  dnaseDensity = [
+    0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374, 0.614, 0.609, 1.019, 1.001,
+    1.334, 1.364, 1.73, 1.71, 0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364, 0.36, 0.62,
+    0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732, 0.054, 0.054, 0.152, 0.148, 0.226,
+    0.222, 0.392, 0.383, 0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724,
+  ]
 
-proc dnase(): tuple[doses: seq[float]; curve: seq[int]] =
+proc dnase(): tuple[doses: seq[float], curve: seq[int]] =
   for c in 0 .. 2:
     for d in dnaseConc:
       result.doses.add d
       result.curve.add c
 
-proc ll4Seq(x: float; p: seq[float]; grad: var seq[float]): float =
+proc ll4Seq(x: float, p: seq[float], grad: var seq[float]): float =
   ## ll5 with Asymmetry = 1, through the runtime-sized interface.
   var q, g: array[drcParamCount, float]
-  for j in 0 ..< 4: q[j] = p[j]
+  for j in 0 ..< 4:
+    q[j] = p[j]
   q[ord(Asymmetry)] = 1.0
   result = ll5(x, q, g)
-  for j in 0 ..< 4: grad[j] = g[j]
+  for j in 0 ..< 4:
+    grad[j] = g[j]
 
 suite "runtime-sized linear algebra and Levenberg–Marquardt":
   test "seq and array routines agree exactly":
@@ -44,12 +50,14 @@ suite "runtime-sized linear algebra and Levenberg–Marquardt":
     var invS: seq[seq[float]]
     check invertSpd(s, invS)
     for i in 0 ..< 3:
-      for j in 0 ..< 3: check invS[i][j] == invA[i][j]
+      for j in 0 ..< 3:
+        check invS[i][j] == invA[i][j]
     var xa: array[3, float]
     var xs: seq[float]
     check solveSpd(a, [1.0, 2.0, 3.0], xa)
     check solveSpd(s, @[1.0, 2.0, 3.0], xs)
-    for i in 0 ..< 3: check xs[i] == xa[i]
+    for i in 0 ..< 3:
+      check xs[i] == xa[i]
 
   test "a seq fit takes the same steps as the array fit":
     var x, w: seq[float]
@@ -57,14 +65,17 @@ suite "runtime-sized linear algebra and Levenberg–Marquardt":
       x.add log10(d)
       w.add 1.0
     let start = [0.5, 7.8, 0.5, -3.0, 1.0]
-    let fixed = levenbergMarquardt(ll5, x, ryegrassRootLength, w, start,
-                                   [true, true, true, true, false])
-    let dynamic = levenbergMarquardt(ll4Seq, x, ryegrassRootLength, w, start[0 ..< 4],
-                                     @[true, true, true, true])
+    let fixed = levenbergMarquardt(
+      ll5, x, ryegrassRootLength, w, start, [true, true, true, true, false]
+    )
+    let dynamic = levenbergMarquardt(
+      ll4Seq, x, ryegrassRootLength, w, start[0 ..< 4], @[true, true, true, true]
+    )
     check dynamic.iterations == fixed.iterations
     check dynamic.status == fixed.status
     check dynamic.ssr == fixed.ssr
-    for j in 0 ..< 4: check dynamic.params[j] == fixed.params[j]
+    for j in 0 ..< 4:
+      check dynamic.params[j] == fixed.params[j]
 
   test "the start may alias the variable receiving the result":
     var x, w: seq[float]
@@ -73,7 +84,9 @@ suite "runtime-sized linear algebra and Levenberg–Marquardt":
       w.add 1.0
     var r: LMDynResult
     r.params = @[0.5, 7.8, 0.5, -3.0]
-    r = levenbergMarquardt(ll4Seq, x, ryegrassRootLength, w, r.params, @[true, true, true, true])
+    r = levenbergMarquardt(
+      ll4Seq, x, ryegrassRootLength, w, r.params, @[true, true, true, true]
+    )
     check r.status.converged
     check close(r.ssr, 5.400214650161578, 1e-9)
 
@@ -98,27 +111,39 @@ suite "joint fits match R nls (DNase)":
     check fit.converged
     check fit.warnings == {}
     check fit.n == 48 and fit.df == 42
-    check fit.params.len == 7  # Bottom, Top, 3 × LogEC50, Hill, Asymmetry (fixed)
+    check fit.params.len == 7 # Bottom, Top, 3 × LogEC50, Hill, Asymmetry (fixed)
     let
-      expected = [0.012153083145364535, 2.2960210356810506, 1.0022379964196355,
-                  0.62687500591840939, 0.6176929850472922, 0.59580357999667788]
-      se = [0.0095714474069814141, 0.054224708409959126, 0.030384658860899121,
-            0.022528818528393384, 0.022572490292757402, 0.022679810945941136]
-      vcov = [9.1612605464611231e-05, -0.00031578470058738232, 0.00022747314762914495,
-              -9.711885393838455e-05, -9.7327030488189039e-05, -9.784555424271014e-05,
-              -0.00031578470058738232, 0.0029403190021450917, -0.0015127839420201962,
-              0.0011610676508598259, 0.001163657218109401, 0.0011699882688050098,
-              0.00022747314762914495, -0.0015127839420201962, 0.00092322749409321555,
-              -0.00057269800789644387, -0.00057376870066595874, -0.00057642141848427016,
-              -9.711885393838455e-05, 0.0011610676508598259, -0.00057269800789644387,
-              0.00050754766428528109, 0.00047327285564801404, 0.00047581224280361515,
-              -9.7327030488189039e-05, 0.001163657218109401, -0.00057376870066595874,
-              0.00047327285564801404, 0.00050951731801662716, 0.00047686158454947526,
-              -9.784555424271014e-05, 0.0011699882688050098, -0.00057642141848427016,
-              0.00047581224280361515, 0.00047686158454947526, 0.00051437382454363144]
+      expected = [
+        0.012153083145364535, 2.2960210356810506, 1.0022379964196355,
+        0.62687500591840939, 0.6176929850472922, 0.59580357999667788,
+      ]
+      se = [
+        0.0095714474069814141, 0.054224708409959126, 0.030384658860899121,
+        0.022528818528393384, 0.022572490292757402, 0.022679810945941136,
+      ]
+      vcov = [
+        9.1612605464611231e-05, -0.00031578470058738232, 0.00022747314762914495,
+        -9.711885393838455e-05, -9.7327030488189039e-05, -9.784555424271014e-05,
+        -0.00031578470058738232, 0.0029403190021450917, -0.0015127839420201962,
+        0.0011610676508598259, 0.001163657218109401, 0.0011699882688050098,
+        0.00022747314762914495, -0.0015127839420201962, 0.00092322749409321555,
+        -0.00057269800789644387, -0.00057376870066595874, -0.00057642141848427016,
+        -9.711885393838455e-05, 0.0011610676508598259, -0.00057269800789644387,
+        0.00050754766428528109, 0.00047327285564801404, 0.00047581224280361515,
+        -9.7327030488189039e-05, 0.001163657218109401, -0.00057376870066595874,
+        0.00047327285564801404, 0.00050951731801662716, 0.00047686158454947526,
+        -9.784555424271014e-05, 0.0011699882688050098, -0.00057642141848427016,
+        0.00047581224280361515, 0.00047686158454947526, 0.00051437382454363144,
+      ]
       # R's coefficient order b, t, h, l1, l2, l3 as slots of the joint vector
-      slots = [fit.index[0][Bottom], fit.index[0][Top], fit.index[0][Hill],
-               fit.index[0][LogEC50], fit.index[1][LogEC50], fit.index[2][LogEC50]]
+      slots = [
+        fit.index[0][Bottom],
+        fit.index[0][Top],
+        fit.index[0][Hill],
+        fit.index[0][LogEC50],
+        fit.index[1][LogEC50],
+        fit.index[2][LogEC50],
+      ]
     for i, slot in slots:
       check near(fit.params[slot], expected[i], se[i])
       check close(sqrt(fit.cov[slot][slot]), se[i], 1e-5)
@@ -153,7 +178,9 @@ suite "joint fits match R nls (DNase)":
     # finding on the fitted curves, gradient by central differences.
     let fit = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top})
     check fit.converged
-    check near(fit.params[fit.index[0][Bottom]], 0.011673323618921537, 0.0092397605852578713)
+    check near(
+      fit.params[fit.index[0][Bottom]], 0.011673323618921537, 0.0092397605852578713
+    )
     check close(fit.curves[1].params[Hill], 1.0270339163214497, 1e-6)
     check close(fit.curves[2].params[LogEC50], 0.5982597126486634, 1e-6)
     check close(fit.curves[2].se[Hill], 0.030988720959629807, 1e-5)
@@ -172,24 +199,36 @@ suite "joint fits match R nls (DNase)":
   test "unequal curve lengths, weights and zero weights":
     # Three rows of run 4 dropped; R fitted without the zero-weight rows.
     const
-      wConc = [0.04882812, 0.04882812, 0.1953125, 0.1953125, 0.390625, 0.390625, 0.78125,
-               0.78125, 1.5625, 1.5625, 3.125, 3.125, 6.25, 6.25, 12.5, 12.5, 0.04882812,
-               0.1953125, 0.390625, 0.390625, 0.78125, 0.78125, 1.5625, 3.125, 3.125, 6.25,
-               6.25, 12.5, 12.5, 0.04882812, 0.04882812, 0.1953125, 0.1953125, 0.390625,
-               0.390625, 0.78125, 0.78125, 1.5625, 1.5625, 3.125, 3.125, 6.25, 6.25, 12.5, 12.5]
-      wDensity = [0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374, 0.614, 0.609, 1.019,
-                  1.001, 1.334, 1.364, 1.73, 1.71, 0.016, 0.118, 0.2, 0.206, 0.364, 0.36, 0.64,
-                  0.979, 0.973, 1.424, 1.399, 1.74, 1.732, 0.054, 0.054, 0.152, 0.148, 0.226,
-                  0.222, 0.392, 0.383, 0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724]
-      wCurve = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-                1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
-      wWeights = [1.0, 2, 0.5, 1, 0, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5,
-                  1, 2, 0.5, 1, 2, 0.5, 1, 2, 0, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1,
-                  2, 0.5]
-    let fit = fitLL4Multi(wConc, wDensity, wCurve, shared = {Bottom, Top, Hill}, weights = wWeights)
+      wConc = [
+        0.04882812, 0.04882812, 0.1953125, 0.1953125, 0.390625, 0.390625, 0.78125,
+        0.78125, 1.5625, 1.5625, 3.125, 3.125, 6.25, 6.25, 12.5, 12.5, 0.04882812,
+        0.1953125, 0.390625, 0.390625, 0.78125, 0.78125, 1.5625, 3.125, 3.125, 6.25,
+        6.25, 12.5, 12.5, 0.04882812, 0.04882812, 0.1953125, 0.1953125, 0.390625,
+        0.390625, 0.78125, 0.78125, 1.5625, 1.5625, 3.125, 3.125, 6.25, 6.25, 12.5, 12.5,
+      ]
+      wDensity = [
+        0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374, 0.614, 0.609, 1.019,
+        1.001, 1.334, 1.364, 1.73, 1.71, 0.016, 0.118, 0.2, 0.206, 0.364, 0.36, 0.64,
+        0.979, 0.973, 1.424, 1.399, 1.74, 1.732, 0.054, 0.054, 0.152, 0.148, 0.226,
+        0.222, 0.392, 0.383, 0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724,
+      ]
+      wCurve = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      ]
+      wWeights = [
+        1.0, 2, 0.5, 1, 0, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5,
+        1, 2, 0.5, 1, 2, 0.5, 1, 2, 0, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2, 0.5, 1, 2,
+        0.5,
+      ]
+    let fit = fitLL4Multi(
+      wConc, wDensity, wCurve, shared = {Bottom, Top, Hill}, weights = wWeights
+    )
     check fit.n == 43 and fit.df == 37
     check fit.curves[1].n == 13
-    check near(fit.params[fit.index[0][Bottom]], 0.0059287617775354053, 0.010642068841095056)
+    check near(
+      fit.params[fit.index[0][Bottom]], 0.0059287617775354053, 0.010642068841095056
+    )
     check close(fit.params[fit.index[0][Top]], 2.3135156470532325, 1e-6)
     check close(fit.params[fit.index[0][Hill]], 0.98505516143174987, 1e-6)
     check close(fit.curves[0].params[LogEC50], 0.63013919556039821, 1e-6)
@@ -216,18 +255,19 @@ suite "joint fits match R nls (DNase)":
 suite "joint fits match R nls (simulated)":
   test "zero-dose controls with shared Bottom, Top and Hill":
     # Two falling curves, controls at dose 0 (x = -Inf in R as here).
-    const
-      y = [98.12, 100.55, 97.49, 103.52, 99.72, 93.2, 97.12, 88.42, 87.94, 63.36, 68.82, 36.44,
-           33.41, 9.42, 19.44, 8.27, 8.35, 8.82, 8.45, 7.06, 8.04, 102.35, 100.22, 94.03, 101.58,
-           99.55, 98.55, 94.6, 95.16, 97.85, 93.01, 88.63, 70.89, 69.56, 36.59, 39.47, 17.61,
-           18.61, 12.64, 11.63, 5.77, 5.5]
+    const y = [
+      98.12, 100.55, 97.49, 103.52, 99.72, 93.2, 97.12, 88.42, 87.94, 63.36, 68.82,
+      36.44, 33.41, 9.42, 19.44, 8.27, 8.35, 8.82, 8.45, 7.06, 8.04, 102.35, 100.22,
+      94.03, 101.58, 99.55, 98.55, 94.6, 95.16, 97.85, 93.01, 88.63, 70.89, 69.56,
+      36.59, 39.47, 17.61, 18.61, 12.64, 11.63, 5.77, 5.5,
+    ]
     var doses: seq[float]
     var curve: seq[int]
     for c in 0 .. 1:
       for _ in 1 .. 3:
         doses.add 0.0
         curve.add c
-      for k in 0 .. 8:  # 10^seq(-8, -4, by = 0.5), duplicates
+      for k in 0 .. 8: # 10^seq(-8, -4, by = 0.5), duplicates
         for _ in 1 .. 2:
           doses.add pow(10.0, -8.0 + 0.5 * float(k))
           curve.add c
@@ -245,16 +285,17 @@ suite "joint fits match R nls (simulated)":
     check close(fit.curves[1].predict(0.0), fit.params[fit.index[0][Top]], 1e-12)
 
   test "5PL with shared Asymmetry":
-    const
-      y = [4.75, 6.37, 10.49, 6.41, 11.92, 12.24, 20.71, 19.29, 36.76, 33.58, 56.72, 57.56,
-           78.13, 77.16, 93.04, 86.9, 95.21, 93.95, 96.27, 95.4, 98.08, 93.14, 97.37, 97.92, 95,
-           91.32, 5.65, 4.04, 7.02, 6.26, 8.7, 8.07, 12.64, 10.6, 16.55, 16.82, 27.7, 28.93,
-           50.31, 50.78, 74.32, 71.96, 87.66, 91.78, 94.45, 96.5, 94.2, 94.53, 94.65, 93.13,
-           93.73, 98.08]
+    const y = [
+      4.75, 6.37, 10.49, 6.41, 11.92, 12.24, 20.71, 19.29, 36.76, 33.58, 56.72, 57.56,
+      78.13, 77.16, 93.04, 86.9, 95.21, 93.95, 96.27, 95.4, 98.08, 93.14, 97.37, 97.92,
+      95, 91.32, 5.65, 4.04, 7.02, 6.26, 8.7, 8.07, 12.64, 10.6, 16.55, 16.82, 27.7,
+      28.93, 50.31, 50.78, 74.32, 71.96, 87.66, 91.78, 94.45, 96.5, 94.2, 94.53, 94.65,
+      93.13, 93.73, 98.08,
+    ]
     var doses: seq[float]
     var curve: seq[int]
     for c in 0 .. 1:
-      for k in 0 .. 12:  # 10^seq(-9, -3, by = 0.5), duplicates
+      for k in 0 .. 12: # 10^seq(-9, -3, by = 0.5), duplicates
         for _ in 1 .. 2:
           doses.add pow(10.0, -9.0 + 0.5 * float(k))
           curve.add c
@@ -287,17 +328,22 @@ suite "joint fits: consistency":
     let joint = fitLL4Multi(ryegrassDose, ryegrassRootLength, ids)
     let single = fitLL4(ryegrassDose, ryegrassRootLength)
     for param in Bottom .. Hill:
-      check near(joint.curves[0].params[param], single.params[param], single.se[param], 1e-5)
+      check near(
+        joint.curves[0].params[param], single.params[param], single.se[param], 1e-5
+      )
       check close(joint.curves[0].se[param], single.se[param], 1e-6)
     check close(joint.ssr, single.ssr, 1e-12)
     check close(joint.aic, single.aic, 1e-12)
 
   test "sharing every parameter is the pooled fit":
-    let joint = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top, LogEC50, Hill})
+    let joint =
+      fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top, LogEC50, Hill})
     let pooled = fitLL4(doses, dnaseDensity)
     check joint.params.len == 5
     for param in Bottom .. Hill:
-      check near(joint.curves[2].params[param], pooled.params[param], pooled.se[param], 1e-5)
+      check near(
+        joint.curves[2].params[param], pooled.params[param], pooled.se[param], 1e-5
+      )
       check close(joint.curves[2].se[param], pooled.se[param], 1e-6)
     check close(joint.ssr, pooled.ssr, 1e-12)
 
@@ -305,9 +351,12 @@ suite "joint fits: consistency":
     let joint = fitLL4Multi(doses, dnaseDensity, curve)
     var totalSsr = 0.0
     for c in 0 .. 2:
-      let single = fitLL4(doses[16 * c ..< 16 * (c + 1)], dnaseDensity[16 * c ..< 16 * (c + 1)])
+      let single =
+        fitLL4(doses[16 * c ..< 16 * (c + 1)], dnaseDensity[16 * c ..< 16 * (c + 1)])
       for param in Bottom .. Hill:
-        check near(joint.curves[c].params[param], single.params[param], single.se[param], 1e-5)
+        check near(
+          joint.curves[c].params[param], single.params[param], single.se[param], 1e-5
+        )
       check close(joint.curves[c].ssr, single.ssr, 1e-8)
       totalSsr += single.ssr
     check close(joint.ssr, totalSsr, 1e-8)
@@ -327,7 +376,8 @@ suite "joint fits: consistency":
   test "summary":
     let fit = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top, Hill})
     let text = fit.summary
-    check "4PL joint fit to 48 observations in 3 curves; shared: Bottom, Top, Hill" in text
+    check "4PL joint fit to 48 observations in 3 curves; shared: Bottom, Top, Hill" in
+      text
     check "LogEC50[2]" in text
     check "EC50[0]" in text
     check "Residual standard error" in text
@@ -337,15 +387,21 @@ suite "joint fits: input checks":
   let (doses, curve) = dnase()
 
   test "invalid input is rejected":
-    expect ValueError: discard fitLL4Multi(doses, dnaseDensity, curve[0 ..< 10])
-    expect ValueError: discard fitLL4Multi([1.0, 2.0], [1.0, 2.0], [0, -1])
+    expect ValueError:
+      discard fitLL4Multi(doses, dnaseDensity, curve[0 ..< 10])
+    expect ValueError:
+      discard fitLL4Multi([1.0, 2.0], [1.0, 2.0], [0, -1])
     var gap = curve
     for c in gap.mitems:
-      if c == 1: c = 3  # ids 0, 2, 3: curve 1 is missing
-    expect ValueError: discard fitLL4Multi(doses, dnaseDensity, gap)
+      if c == 1:
+        c = 3 # ids 0, 2, 3: curve 1 is missing
+    expect ValueError:
+      discard fitLL4Multi(doses, dnaseDensity, gap)
     var w = newSeq[float](doses.len)
-    for i in 0 ..< w.len: w[i] = (if curve[i] == 2: 0.0 else: 1.0)
-    expect ValueError: discard fitLL4Multi(doses, dnaseDensity, curve, weights = w)
+    for i in 0 ..< w.len:
+      w[i] = (if curve[i] == 2: 0.0 else: 1.0)
+    expect ValueError:
+      discard fitLL4Multi(doses, dnaseDensity, curve, weights = w)
     expect ValueError:
       discard fitLL4Multi(doses, dnaseDensity, curve, opts = FitOptions(loss: Huber))
     expect ValueError:
@@ -355,7 +411,8 @@ suite "joint fits: input checks":
     let few = [0, 0, 0, 0, 0, 0, 1, 1, 1]
     let d = [0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 0.1, 1.0, 10.0]
     let r = [1.0, 1.2, 2.0, 3.5, 4.0, 4.1, 1.1, 2.2, 4.0]
-    expect ValueError: discard fitLL4Multi(d, r, few)  # curve 1: 3 points, 4 parameters
+    expect ValueError:
+      discard fitLL4Multi(d, r, few) # curve 1: 3 points, 4 parameters
     let fit = fitLL4Multi(d, r, few, shared = {Bottom, Top})
     check fit.df == 9 - 6
 
@@ -374,14 +431,18 @@ suite "joint fits: input checks":
   test "F test checks that the fits are nested on the same data":
     let parallel = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top, Hill})
     let separate = fitLL4Multi(doses, dnaseDensity, curve)
-    expect ValueError: discard fTest(separate, parallel)
+    expect ValueError:
+      discard fTest(separate, parallel)
     let common = fitLL4Multi(doses, dnaseDensity, curve, shared = {Top, Hill})
-    let other = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Hill, LogEC50})
-    expect ValueError: discard fTest(other, common)  # does not share Top
+    let other =
+      fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Hill, LogEC50})
+    expect ValueError:
+      discard fTest(other, common) # does not share Top
     var shifted = @dnaseDensity
     shifted[0] += 0.001
     let elsewhere = fitLL4Multi(doses, shifted, curve)
-    expect ValueError: discard fTest(parallel, elsewhere)
+    expect ValueError:
+      discard fTest(parallel, elsewhere)
     # Pooled data against parallel curves: different curve ids, same data.
     let pooled = fitLL4Multi(doses, dnaseDensity, newSeq[int](doses.len))
     let t = fTest(pooled, parallel)

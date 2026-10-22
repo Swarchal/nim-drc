@@ -7,19 +7,23 @@ import ryegrass
 # agree with scipy.optimize.curve_fit. ECx intervals use the delta method with
 # finite-difference gradients in R, independent of the analytic ones here.
 const
-  asymDose = [0.0, 0.0, 1e-09, 1e-09, 3.1622776601683795e-09, 3.1622776601683795e-09,
-              1e-08, 1e-08, 3.162277660168379e-08, 3.162277660168379e-08, 1e-07, 1e-07,
-              3.162277660168379e-07, 3.162277660168379e-07, 1e-06, 1e-06,
-              3.162277660168379e-06, 3.162277660168379e-06, 1e-05, 1e-05,
-              3.1622776601683795e-05, 3.1622776601683795e-05, 0.0001, 0.0001,
-              0.00031622776601683794, 0.00031622776601683794, 0.001, 0.001]
-  asymResponse = [5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38, 37.01, 36.75,
-                  54.87, 52.8, 75.55, 77.0, 86.17, 87.94, 89.67, 90.89, 90.97, 94.18, 92.39,
-                  95.46, 95.3, 94.61, 89.96, 93.92]
+  asymDose = [
+    0.0, 0.0, 1e-09, 1e-09, 3.1622776601683795e-09, 3.1622776601683795e-09, 1e-08,
+    1e-08, 3.162277660168379e-08, 3.162277660168379e-08, 1e-07, 1e-07,
+    3.162277660168379e-07, 3.162277660168379e-07, 1e-06, 1e-06, 3.162277660168379e-06,
+    3.162277660168379e-06, 1e-05, 1e-05, 3.1622776601683795e-05, 3.1622776601683795e-05,
+    0.0001, 0.0001, 0.00031622776601683794, 0.00031622776601683794, 0.001, 0.001,
+  ]
+  asymResponse = [
+    5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38, 37.01, 36.75, 54.87,
+    52.8, 75.55, 77.0, 86.17, 87.94, 89.67, 90.89, 90.97, 94.18, 92.39, 95.46, 95.3,
+    94.61, 89.96, 93.92,
+  ]
 
-proc close(a, b: float; rel = 1e-5): bool = abs(a - b) <= rel * abs(b)
+proc close(a, b: float, rel = 1e-5): bool =
+  abs(a - b) <= rel * abs(b)
 
-proc checkInterval(ci: ConfInt; lower, upper: float) =
+proc checkInterval(ci: ConfInt, lower, upper: float) =
   check close(ci.lower, lower)
   check close(ci.upper, upper)
 
@@ -72,8 +76,10 @@ suite "5PL":
     check close(fixed5.aic, four.aic, 1e-10)
 
   test "Asymmetry can only be fixed to a positive value, and only in a 5PL":
-    expect ValueError: discard fitLL5(asymDose, asymResponse, fixed = [(Asymmetry, 0.0)])
-    expect ValueError: discard fitLL4(asymDose, asymResponse, fixed = [(Asymmetry, 1.0)])
+    expect ValueError:
+      discard fitLL5(asymDose, asymResponse, fixed = [(Asymmetry, 0.0)])
+    expect ValueError:
+      discard fitLL4(asymDose, asymResponse, fixed = [(Asymmetry, 1.0)])
 
 suite "3PL":
   test "is the 4PL with Bottom fixed":

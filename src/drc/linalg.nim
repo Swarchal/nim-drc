@@ -6,29 +6,41 @@
 
 import std/math
 
-func isFinite*(x: float): bool = x.classify notin {fcInf, fcNegInf, fcNan}
+func isFinite*(x: float): bool =
+  x.classify notin {fcInf, fcNegInf, fcNan}
 
 # Sizing helpers: no-ops for arrays, whose size is part of the type.
 
-proc ensureLen*[N: static int](v: var array[N, float]; n: int) {.inline.} = discard
-proc ensureLen*(v: var seq[float]; n: int) {.inline.} = v.setLen n
+proc ensureLen*[N: static int](v: var array[N, float], n: int) {.inline.} =
+  discard
 
-proc ensureShape*[N: static int](m: var array[N, array[N, float]]; n: int) {.inline.} = discard
-proc ensureShape*(m: var seq[seq[float]]; n: int) =
+proc ensureLen*(v: var seq[float], n: int) {.inline.} =
+  v.setLen n
+
+proc ensureShape*[N: static int](m: var array[N, array[N, float]], n: int) {.inline.} =
+  discard
+
+proc ensureShape*(m: var seq[seq[float]], n: int) =
   ## Makes `m` n×n (new entries are 0).
   m.setLen n
-  for row in m.mitems: row.setLen n
+  for row in m.mitems:
+    row.setLen n
 
-proc setZero*[N: static int](v: var array[N, float]) {.inline.} = v = default(array[N, float])
+proc setZero*[N: static int](v: var array[N, float]) {.inline.} =
+  v = default(array[N, float])
+
 proc setZero*(v: var seq[float]) {.inline.} =
-  for x in v.mitems: x = 0.0
+  for x in v.mitems:
+    x = 0.0
 
 proc setZero*[N: static int](m: var array[N, array[N, float]]) {.inline.} =
   m = default(array[N, array[N, float]])
-proc setZero*(m: var seq[seq[float]]) =
-  for row in m.mitems: row.setZero()
 
-proc cholesky*[M](a: M; l: var M): bool =
+proc setZero*(m: var seq[seq[float]]) =
+  for row in m.mitems:
+    row.setZero()
+
+proc cholesky*[M](a: M, l: var M): bool =
   ## Computes lower-triangular `l` with `a = l * lᵀ`. Only the lower triangle
   ## of `a` is read. Returns false if `a` is not (numerically) positive definite.
   let n = a.len
@@ -38,7 +50,7 @@ proc cholesky*[M](a: M; l: var M): bool =
     var d = a[j][j]
     for k in 0 ..< j:
       d -= l[j][k] * l[j][k]
-    if not (d > 0.0):  # also rejects NaN
+    if not (d > 0.0): # also rejects NaN
       return false
     l[j][j] = sqrt(d)
     for i in j + 1 ..< n:
@@ -48,7 +60,7 @@ proc cholesky*[M](a: M; l: var M): bool =
       l[i][j] = s / l[j][j]
   true
 
-proc choleskySolve*[M, V](l: M; b: V): V =
+proc choleskySolve*[M, V](l: M, b: V): V =
   ## Solves `l * lᵀ * x = b` given the Cholesky factor `l`.
   let n = l.len
   var z: V
@@ -65,7 +77,7 @@ proc choleskySolve*[M, V](l: M; b: V): V =
       s -= l[k][i] * result[k]
     result[i] = s / l[i][i]
 
-proc solveSpd*[M, V](a: M; b: V; x: var V): bool =
+proc solveSpd*[M, V](a: M, b: V, x: var V): bool =
   ## Solves `a * x = b` for symmetric positive definite `a`.
   var l: M
   if not cholesky(a, l):
@@ -73,7 +85,7 @@ proc solveSpd*[M, V](a: M; b: V; x: var V): bool =
   x = choleskySolve(l, b)
   true
 
-proc invertSpd*[M](a: M; inv: var M): bool =
+proc invertSpd*[M](a: M, inv: var M): bool =
   ## Inverts symmetric positive definite `a`. Returns false if it is not positive definite.
   let n = a.len
   var l: M
@@ -92,7 +104,7 @@ proc invertSpd*[M](a: M; inv: var M): bool =
       inv[j][i] = col[i]
   true
 
-proc pinFixed*[M, B](m: var M; free: B) =
+proc pinFixed*[M, B](m: var M, free: B) =
   ## Replaces the rows and columns of fixed (non-free) parameters with those of
   ## the identity, so they decouple from the free ones in a linear solve.
   let n = m.len

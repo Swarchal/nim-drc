@@ -2,7 +2,8 @@ import std/[math, strutils, unittest]
 import drc
 import ryegrass
 
-proc close(a, b: float; rel: float): bool = abs(a - b) <= rel * abs(b)
+proc close(a, b: float, rel: float): bool =
+  abs(a - b) <= rel * abs(b)
 
 proc rosenbrock(p: array[3, float]): float =
   (1.0 - p[0]) ^ 2 + 100.0 * (p[1] - p[0] ^ 2) ^ 2 + p[2] ^ 2
@@ -21,7 +22,9 @@ suite "Nelder–Mead":
     check abs(r.params[0] - 1.0) < 1e-6
 
   test "NaN counts as +Inf":
-    proc f(p: array[1, float]): float = (if p[0] < 0.0: NaN else: (p[0] - 2.0) ^ 2)
+    proc f(p: array[1, float]): float =
+      (if p[0] < 0.0: NaN else: (p[0] - 2.0) ^ 2)
+
     let r = nelderMead(f, [1.0], [true])
     check abs(r.params[0] - 2.0) < 1e-6
 
@@ -32,7 +35,9 @@ suite "Nelder–Mead":
     check r.value == rosenbrock([-1.2, 1.0, 0.5])
 
   test "stops at maxEval":
-    let r = nelderMead(rosenbrock, [-1.2, 1.0, 0.5], [true, true, true], NMOptions(maxEval: 20))
+    let r = nelderMead(
+      rosenbrock, [-1.2, 1.0, 0.5], [true, true, true], NMOptions(maxEval: 20)
+    )
     check not r.converged
     check r.evaluations <= 25
 
@@ -41,20 +46,28 @@ suite "multi-start":
   # from the default start stops in a local minimum. 669.8355816 is also the
   # best SSR SciPy's curve_fit finds from 3000 random starts.
   const
-    dose = [1e-9, 1.161749920676094e-8, 3.1629918890385245e-8, 0.00000021202993733263668,
-            0.00002911371875035665]
-    resp = [17.840260081080757, -16.695409693569324, -9.847221967902513,
-            -4.111836129419825, 44.44746199771957]
+    dose = [
+      1e-9, 1.161749920676094e-8, 3.1629918890385245e-8, 0.00000021202993733263668,
+      0.00002911371875035665,
+    ]
+    resp = [
+      17.840260081080757, -16.695409693569324, -9.847221967902513, -4.111836129419825,
+      44.44746199771957,
+    ]
 
   test "escapes a local minimum":
-    let single = fitLL4(dose, resp, opts = FitOptions(multiStart: false, fallback: false))
+    let single =
+      fitLL4(dose, resp, opts = FitOptions(multiStart: false, fallback: false))
     let multi = fitLL4(dose, resp)
     check single.ssr > 2000.0
     check close(multi.ssr, 669.8355816295317, 1e-8)
 
   test "gives the same answer as a single start on well-behaved data":
-    let single = fitLL4(ryegrassDose, ryegrassRootLength,
-                        opts = FitOptions(multiStart: false, fallback: false))
+    let single = fitLL4(
+      ryegrassDose,
+      ryegrassRootLength,
+      opts = FitOptions(multiStart: false, fallback: false),
+    )
     let multi = fitLL4(ryegrassDose, ryegrassRootLength)
     check multi.params == single.params
 
@@ -74,18 +87,22 @@ suite "Nelder–Mead fallback":
     check "the Nelder–Mead fallback converged (final polishing run:" in fit.summary
 
   test "without the fallback, non-convergence is reported":
-    let fit = fitLL4(ryegrassDose, ryegrassRootLength,
-                     opts = FitOptions(lm: starved, fallback: false))
+    let fit = fitLL4(
+      ryegrassDose, ryegrassRootLength, opts = FitOptions(lm: starved, fallback: false)
+    )
     check not fit.usedFallback
     check not fit.converged
     check fwNotConverged in fit.warnings
 
   test "every parameter fixed, with Hill = 0 and zero-dose controls":
     # Previously the model gave NaN at zero dose and Nelder–Mead indexed out of bounds.
-    let fit = fitLL4([0.0, 0.0, 1.0, 10.0, 100.0, 1000.0], [5.0, 6.0, 5.0, 6.0, 5.0, 6.0],
-                     fixed = [(Bottom, 0.0), (Top, 10.0), (LogEC50, 1.0), (Hill, 0.0)])
+    let fit = fitLL4(
+      [0.0, 0.0, 1.0, 10.0, 100.0, 1000.0],
+      [5.0, 6.0, 5.0, 6.0, 5.0, 6.0],
+      fixed = [(Bottom, 0.0), (Top, 10.0), (LogEC50, 1.0), (Hill, 0.0)],
+    )
     check fit.converged
-    check abs(fit.ssr - 3.0) < 1e-12  # the flat curve is 5; residuals 0, 1, 0, 1, 0, 1
+    check abs(fit.ssr - 3.0) < 1e-12 # the flat curve is 5; residuals 0, 1, 0, 1, 0, 1
     check fit.predict(0.0) == 5.0
 
   test "is not used when Levenberg–Marquardt converges":

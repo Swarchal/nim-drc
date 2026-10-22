@@ -9,18 +9,23 @@ import ryegrass
 # and 25. Standard errors follow MASS::rlm's default (Huber) covariance,
 # computed independently in R from finite-difference Jacobians at the nlrob fit.
 const
-  dose = [1e-09, 1e-09, 1e-09, 3.1622776601683795e-09, 3.1622776601683795e-09,
-          3.1622776601683795e-09, 1e-08, 1e-08, 1e-08, 3.162277660168379e-08,
-          3.162277660168379e-08, 3.162277660168379e-08, 1e-07, 1e-07, 1e-07,
-          3.162277660168379e-07, 3.162277660168379e-07, 3.162277660168379e-07, 1e-06, 1e-06,
-          1e-06, 3.162277660168379e-06, 3.162277660168379e-06, 3.162277660168379e-06, 1e-05,
-          1e-05, 1e-05, 3.1622776601683795e-05, 3.1622776601683795e-05,
-          3.1622776601683795e-05, 0.0001, 0.0001, 0.0001]
-  response = [104.03, 90.24, 99.16, 95.92, 136.26, 96.97, 90.44, 95.81, 93.91, 102.27, 92.98,
-              91.24, 77.88, 76.72, 75.56, 48.83, 16.45, 49.28, 24.15, 20.67, 21.35, 12.34, 9.33,
-              6.18, 2.95, 35.12, 9.3, 1.57, 1.65, 5.39, -0.56, 1.22, 4.74]
+  dose = [
+    1e-09, 1e-09, 1e-09, 3.1622776601683795e-09, 3.1622776601683795e-09,
+    3.1622776601683795e-09, 1e-08, 1e-08, 1e-08, 3.162277660168379e-08,
+    3.162277660168379e-08, 3.162277660168379e-08, 1e-07, 1e-07, 1e-07,
+    3.162277660168379e-07, 3.162277660168379e-07, 3.162277660168379e-07, 1e-06, 1e-06,
+    1e-06, 3.162277660168379e-06, 3.162277660168379e-06, 3.162277660168379e-06, 1e-05,
+    1e-05, 1e-05, 3.1622776601683795e-05, 3.1622776601683795e-05,
+    3.1622776601683795e-05, 0.0001, 0.0001, 0.0001,
+  ]
+  response = [
+    104.03, 90.24, 99.16, 95.92, 136.26, 96.97, 90.44, 95.81, 93.91, 102.27, 92.98,
+    91.24, 77.88, 76.72, 75.56, 48.83, 16.45, 49.28, 24.15, 20.67, 21.35, 12.34, 9.33,
+    6.18, 2.95, 35.12, 9.3, 1.57, 1.65, 5.39, -0.56, 1.22, 4.74,
+  ]
 
-proc close(a, b: float; rel: float): bool = abs(a - b) <= rel * max(1e-3, abs(b))
+proc close(a, b: float, rel: float): bool =
+  abs(a - b) <= rel * max(1e-3, abs(b))
 
 suite "loss functions":
   test "match robustbase's weights and ψ'":
@@ -37,8 +42,11 @@ suite "loss functions":
   test "ψ is u times the weight":
     for loss in [Squared, Huber, Tukey]:
       for u in [-6.0, -1.0, 0.3, 2.0, 4.0]:
-        check abs(psi(loss, u, defaultTuning(loss)) -
-                  u * psiWeight(loss, u, defaultTuning(loss))) < 1e-14
+        check abs(
+          psi(loss, u, defaultTuning(loss)) - u * psiWeight(
+            loss, u, defaultTuning(loss)
+          )
+        ) < 1e-14
 
   test "ψ' matches finite differences":
     for loss in [Huber, Tukey]:
@@ -88,8 +96,10 @@ suite "robust fits with outliers":
     check close(ci.upper, 3.5090319969724354e-07, 1e-5)
     var rejected: seq[int]
     for i, rw in tukey.robustWeights:
-      if rw == 0.0: rejected.add i
-    check rejected == @[4, 9, 16, 25]  # the three planted errors and one large natural residual
+      if rw == 0.0:
+        rejected.add i
+    check rejected ==
+      @[4, 9, 16, 25] # the three planted errors and one large natural residual
     check close(tukey.robustWeights[0], 0.32131392401009551, 1e-5)
     check close(tukey.robustWeights[26], 0.60003789842593058, 1e-5)
 
@@ -114,17 +124,21 @@ suite "robust fits with outliers":
   test "bands use the robust covariance and scale":
     let b = huber.confidenceBand(3e-7)
     check b.fit == huber.predict(3e-7)
-    check b.upper - b.lower < ls.confidenceBand(3e-7).upper - ls.confidenceBand(3e-7).lower
+    check b.upper - b.lower <
+      ls.confidenceBand(3e-7).upper - ls.confidenceBand(3e-7).lower
     let p = huber.predictionBand(3e-7)
     check p.upper - p.lower > b.upper - b.lower
 
 suite "robust fits: options and edge cases":
   test "a huge Huber tuning constant is least squares":
     let ls = fitLL4(ryegrassDose, ryegrassRootLength)
-    let wide = fitLL4(ryegrassDose, ryegrassRootLength, opts = FitOptions(loss: Huber, tuning: 1e9))
+    let wide = fitLL4(
+      ryegrassDose, ryegrassRootLength, opts = FitOptions(loss: Huber, tuning: 1e9)
+    )
     for param in Bottom .. Hill:
       check close(wide.params[param], ls.params[param], 1e-8)
-    for rw in wide.robustWeights: check rw == 1.0
+    for rw in wide.robustWeights:
+      check rw == 1.0
 
   test "on clean data a Huber fit stays close to least squares":
     let ls = fitLL4(ryegrassDose, ryegrassRootLength)
@@ -136,7 +150,8 @@ suite "robust fits: options and edge cases":
     var d = @dose
     var r = @response
     var w = newSeq[float](d.len)
-    for x in w.mitems: x = 1.0
+    for x in w.mitems:
+      x = 1.0
     d.add 1e-6
     r.add 500.0
     w.add 0.0
@@ -152,8 +167,10 @@ suite "robust fits: options and edge cases":
     check fit.se[Asymmetry].isFinite
 
   test "invalid tuning is rejected":
-    expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Huber, tuning: 0.0))
-    expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Tukey, tuning: -1.0))
+    expect ValueError:
+      discard fitLL4(dose, response, opts = FitOptions(loss: Huber, tuning: 0.0))
+    expect ValueError:
+      discard fitLL4(dose, response, opts = FitOptions(loss: Tukey, tuning: -1.0))
 
   test "ψ is bounded at infinite residuals":
     check psi(Huber, Inf, 1.345) == 1.345
@@ -169,25 +186,33 @@ suite "robust fits: options and edge cases":
       let fit = fitLL4(stepDose, stepResp, opts = FitOptions(loss: loss))
       check fit.sigma > 1e-6
       for i, rw in fit.robustWeights:
-        if i == 3: check rw < 1e-3
-        else: check rw == 1.0
+        if i == 3:
+          check rw < 1e-3
+        else:
+          check rw == 1.0
 
   test "invalid reweighting options are rejected":
-    expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Huber, irlsMaxIter: 0))
-    expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Huber, irlsTol: NaN))
-    expect ValueError: discard fitLL4(dose, response, opts = FitOptions(loss: Tukey, irlsTol: -1.0))
+    expect ValueError:
+      discard fitLL4(dose, response, opts = FitOptions(loss: Huber, irlsMaxIter: 0))
+    expect ValueError:
+      discard fitLL4(dose, response, opts = FitOptions(loss: Huber, irlsTol: NaN))
+    expect ValueError:
+      discard fitLL4(dose, response, opts = FitOptions(loss: Tukey, irlsTol: -1.0))
 
   test "unfinished reweighting is not reported as converged":
     let fit = fitLL4(dose, response, opts = FitOptions(loss: Huber, irlsMaxIter: 3))
     check fwRobustNotConverged in fit.warnings
-    check fwNotConverged notin fit.warnings  # each refit itself converged
+    check fwNotConverged notin fit.warnings # each refit itself converged
     check not fit.converged
 
   test "the summary separates the fallback from the reweighting":
     # Two iterations are too few for the least-squares stage, but the refits start
     # from the converged fallback fit.
-    let fit = fitLL4(ryegrassDose, ryegrassRootLength,
-                     opts = FitOptions(loss: Huber, lm: LMOptions(maxIter: 2)))
+    let fit = fitLL4(
+      ryegrassDose,
+      ryegrassRootLength,
+      opts = FitOptions(loss: Huber, lm: LMOptions(maxIter: 2)),
+    )
     check fit.usedFallback and fit.fallbackConverged
     check fit.converged
     check "the Nelder–Mead fallback converged. Last reweighting round:" in fit.summary
