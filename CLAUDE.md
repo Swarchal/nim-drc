@@ -42,6 +42,7 @@ Design decisions that span files:
   5. Compute covariance with `normalEquations` (user weights) at the final parameters, independent of which optimiser produced them. Least squares uses σ²(JᵀWJ)⁻¹. Robust fits use Huber's correction as in `MASS::rlm`, κ²·S/mean(ψ′)². For robust fits, `sigma` is the MAD scale and `logLik`/`aic`/`bic` are NaN.
 - Confidence/prediction bands (`bandAt`) are gᵀ·cov·g from `ll5`'s gradient, plus σ²/weight for prediction.
 - **Convergence:** `LMStatus.converged` includes `lmStationary` (no downhill step and gradient ≈ 0, or a near-perfect fit) but not `lmStalled`. After the fallback, `DrcFit.converged` can be true while `status` (the final LM polish) is not; `fallbackConverged` records the fallback's own outcome. `DrcFit.converged` is false exactly when `fwNotConverged` or `fwRobustNotConverged` is set.
+- **Bounds** (`bounds = [(Hill, -10.0 .. -0.1)]`, a `Box` of ±Inf-padded `lower`/`upper` vectors internally): projected LM in `lmCore`. Each trial point is clamped into the box, and the active set (free parameters on a bound whose gradient g = JᵀWr points outwards) is pinned for that solve, as fixed ones are. `stationary` checks only the non-active parameters. Nelder–Mead clamps each vertex. Starts are clamped in `fitCurve`/`fitMulti` before `searchLM`, because the symmetric 5PL stage holds Asymmetry at its start value, which must lie within the box. A parameter can't be both fixed and bounded. Parameters that end exactly on a bound go in `atBound` (and raise `fwAtBound`), but they still count as free in df/AIC/covariance, matching `nls(algorithm = "port")` and SciPy.
 - **Fixed parameters:** standard error 0, covariance rows 0, and they don't count toward `df`/AIC. Standard errors are NaN when unidentifiable or when df = 0, and problems are reported in `fit.warnings`, not raised. Invalid input raises `ValueError`.
 - **Weights** are relative (variance σ²/wᵢ, as in R's `nls`). Zero-weight points are excluded from `n`, `df`, AIC and the starting guess.
 - **Joint fits** (`fitMulti`):
@@ -53,7 +54,7 @@ Design decisions that span files:
 ## Testing conventions
 
 - Numeric results are validated against **external references**, not against this code's own output. The reference values are hard-coded in the tests:
-  - R `nls` (joint fits use indexed parameters, e.g. `l[c]`), `anova`, `qt`, `pt`, `pbeta` and `pf`.
+  - R `nls` (joint fits use indexed parameters, e.g. `l[c]`; bounded fits use `algorithm = "port"`), `anova`, `qt`, `pt`, `pbeta` and `pf`.
   - `robustbase::nlrob` for robust fits.
   - SciPy `curve_fit`.
   - `drc`'s published ryegrass estimates (the data are in `tests/ryegrass.nim`).
@@ -62,3 +63,8 @@ Design decisions that span files:
 - Synthetic-data tests write out the curve formula on purpose, as an independent check on `ll5`.
 - R's `nls` stops at its relative-offset tolerance (1e-5, and it fails to converge if tightened on these data), so it can be ~1e-7 short of the optimum. Compare estimates against it in units of their standard error (`near` in `tests/tmulti.nim`, 2e-5·SE), not relative to the value; a Bottom near 0 fails relative checks.
 - **Keep README examples truthful.** Their output blocks are copied from real runs, so re-run the snippets after behaviour changes.
+
+
+## Formatting conventions
+
+- Code should be formatted with `nph` or if `nph` is not available, manually formatted to a similar style.
