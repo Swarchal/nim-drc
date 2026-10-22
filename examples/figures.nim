@@ -285,35 +285,37 @@ proc robustFigure(): Chart =
 
 proc multiFigure(): Chart =
   ## README, "Several curves: shared parameters and relative potency".
-  # R's DNase assay, runs 1, 4 and 8: duplicate wells at eight concentrations
-  let conc = [0.04882812, 0.1953125, 0.390625, 0.78125, 1.5625, 3.125, 6.25, 12.5]
-  let density = [
-    0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374, 0.614, 0.609, 1.019, 1.001,
-    1.334, 1.364, 1.73, 1.71, 0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364, 0.36, 0.62,
-    0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732, 0.054, 0.054, 0.152, 0.148, 0.226,
-    0.222, 0.392, 0.383, 0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724,
+  # Simulated potency assay: a reference standard and two test samples, each at
+  # nine half-log concentrations (0.01 to 100 ng/ml) in duplicate.
+  let response = [
+    0.037, 0.07, 0.059, 0.157, 0.207, 0.161, 0.498, 0.508, 1.048, 1.013, 1.632, 1.587,
+    1.832, 1.768, 2.002, 1.956, 1.987, 2.026, 0.138, 0.129, 0.269, 0.263, 0.574, 0.492,
+    1.175, 1.148, 1.645, 1.593, 1.868, 1.904, 2.021, 1.963, 2.006, 1.988, 1.942, 1.981,
+    0.036, 0.05, 0.101, 0.088, 0.069, 0.066, 0.167, 0.162, 0.306, 0.305, 0.799, 0.815,
+    1.375, 1.415, 1.789, 1.749, 1.944, 1.885,
   ]
   var doses: seq[float]
   var curve: seq[int] # which curve each observation belongs to
-  for c in 0 .. 2:
-    for d in conc:
-      doses.add [d, d]
+  for c in 0 .. 2: # 0: reference, 1: sample A, 2: sample B
+    for k in 0 .. 8:
+      let dose = pow(10.0, -2.0 + 0.5 * float(k))
+      doses.add [dose, dose]
       curve.add [c, c]
-  let parallel = fitLL4Multi(doses, density, curve, shared = {Bottom, Top, Hill})
+  let parallel = fitLL4Multi(doses, response, curve, shared = {Bottom, Top, Hill})
 
-  let axis = doseAxis("DNase concentration (ng/ml)", 0.03, 20.0)
+  let axis = doseAxis("Concentration (ng/ml)", 0.006, 160.0)
 
   # `parallel.curves[c]` is curve c's own fit, so it plots like any other.
-  let runs = ["run 1", "run 4", "run 8"]
+  let samples = ["reference", "sample A", "sample B"]
   var curves: seq[Series]
-  for c, run in runs:
-    curves.add series(run, parallel.curves[c])
-  let runOfObservation = curve.mapIt(runs[it])
-  let color = seriesColors(runs, [blue, orange, aqua], legendAt = "top-left")
+  for c, sample in samples:
+    curves.add series(sample, parallel.curves[c])
+  let sampleOfObservation = curve.mapIt(samples[it])
+  let color = seriesColors(samples, [blue, orange, aqua], legendAt = "top-left")
 
-  let lines = axis.curveLines(curves, "Optical density", color)
+  let lines = axis.curveLines(curves, "Response", color)
   let observations = axis.seriesDots(
-    axis.observationFrame(doses, density, labels = runOfObservation), color
+    axis.observationFrame(doses, response, labels = sampleOfObservation), color
   )
 
   layer(lines, observations).finish("Parallel 4PL curves (shared Bottom, Top and Hill)")

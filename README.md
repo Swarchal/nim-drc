@@ -365,60 +365,66 @@ curves. Sharing Bottom, Top and Hill fits parallel curves that differ only in
 EC50, the usual model for a relative potency assay:
 
 ```nim
-import std/strformat
+import std/[math, strformat]
 import drc
 
-# R's DNase assay, runs 1, 4 and 8: duplicate wells at eight concentrations
-let conc = [0.04882812, 0.1953125, 0.390625, 0.78125, 1.5625, 3.125, 6.25, 12.5]
-let density = [0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374,
-               0.614, 0.609, 1.019, 1.001, 1.334, 1.364, 1.73, 1.71,
-               0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364, 0.36,
-               0.62, 0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732,
-               0.054, 0.054, 0.152, 0.148, 0.226, 0.222, 0.392, 0.383,
-               0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724]
+# Simulated potency assay: a reference standard and two test samples, each at
+# nine half-log concentrations (0.01 to 100 ng/ml) in duplicate. The samples
+# were simulated as 4× and 1/5× as potent as the reference.
+let response = [0.037, 0.07, 0.059, 0.157, 0.207, 0.161, 0.498, 0.508, 1.048,
+                1.013, 1.632, 1.587, 1.832, 1.768, 2.002, 1.956, 1.987, 2.026,
+                0.138, 0.129, 0.269, 0.263, 0.574, 0.492, 1.175, 1.148, 1.645,
+                1.593, 1.868, 1.904, 2.021, 1.963, 2.006, 1.988, 1.942, 1.981,
+                0.036, 0.05, 0.101, 0.088, 0.069, 0.066, 0.167, 0.162, 0.306,
+                0.305, 0.799, 0.815, 1.375, 1.415, 1.789, 1.749, 1.944, 1.885]
 var doses: seq[float]
 var curve: seq[int]  # which curve each observation belongs to
-for c in 0 .. 2:
-  for d in conc:
-    doses.add [d, d]
+for c in 0 .. 2:     # 0: reference, 1: sample A, 2: sample B
+  for k in 0 .. 8:
+    let dose = pow(10.0, -2.0 + 0.5 * float(k))
+    doses.add [dose, dose]
     curve.add [c, c]
 
-let parallel = fitLL4Multi(doses, density, curve, shared = {Bottom, Top, Hill})
-let separate = fitLL4Multi(doses, density, curve)
+let parallel = fitLL4Multi(doses, response, curve, shared = {Bottom, Top, Hill})
+let separate = fitLL4Multi(doses, response, curve)
 echo parallel.summary
 echo ""
 let t = fTest(parallel, separate)
 echo &"parallel vs separate curves: F = {t.f:.3f} on {t.df1} and {t.df2} df, p = {t.p:.3f}"
-let rp = parallel.relativePotency(0, 2)
-echo &"EC50 of run 1 / run 8: {rp.ratio:.3f} (95% CI {rp.ci.lower:.3f}–{rp.ci.upper:.3f})"
+for (c, name) in [(1, "A"), (2, "B")]:
+  # Potency relative to the reference is EC50(reference) / EC50(sample).
+  let rp = parallel.relativePotency(0, c)
+  echo &"potency of sample {name}: {rp.ratio:.2f}× the reference (95% CI {rp.ci.lower:.2f}–{rp.ci.upper:.2f})"
 ```
 
 ```
-4PL joint fit to 48 observations in 3 curves; shared: Bottom, Top, Hill
+4PL joint fit to 54 observations in 3 curves; shared: Bottom, Top, Hill
 
                 Estimate   Std.Error     Lower 95%     Upper 95%
-Bottom         0.0121531  0.00957145   -0.00716285     0.0314691
-Top              2.29602   0.0542247       2.18659       2.40545
-LogEC50[0]      0.626875   0.0225288      0.581410      0.672340
-LogEC50[1]      0.617693   0.0225725      0.572140      0.663246
-LogEC50[2]      0.595804   0.0226798      0.550034      0.641573
-Hill             1.00224   0.0303847      0.940919       1.06356
-EC50[0]          4.23521                   3.81426       4.70262
-EC50[1]          4.14661                   3.73370       4.60518
-EC50[2]          3.94279                   3.54841       4.38100
+Bottom         0.0590232   0.0105121     0.0378872     0.0801591
+Top              1.99553   0.0108034       1.97381       2.01725
+LogEC50[0]    -0.0103233   0.0155870    -0.0416630     0.0210164
+LogEC50[1]     -0.590799   0.0155616     -0.622087     -0.559510
+LogEC50[2]      0.693711   0.0155490      0.662448      0.724975
+Hill             1.10504   0.0283800       1.04798       1.16210
+EC50[0]         0.976510                  0.908525       1.04958
+EC50[1]         0.256567                  0.238733      0.275734
+EC50[2]          4.93982                   4.59672       5.30853
 
-Residual standard error: 0.0206314 on 42 degrees of freedom
-R²: 0.998922   AIC: -228.762   BIC: -215.663
-Stopped after 6 iterations: relative change in SSR below ftol
+Residual standard error: 0.0338013 on 48 degrees of freedom
+R²: 0.998349   AIC: -204.938   BIC: -191.016
+Stopped after 5 iterations: relative change in SSR below ftol
 
-parallel vs separate curves: F = 2.131 on 6 and 36 df, p = 0.074
-EC50 of run 1 / run 8: 1.074 (95% CI 1.033–1.117)
+parallel vs separate curves: F = 0.631 on 6 and 42 df, p = 0.705
+potency of sample A: 3.81× the reference (95% CI 3.49–4.16)
+potency of sample B: 0.20× the reference (95% CI 0.18–0.22)
 ```
 
-Here the F test finds no evidence against parallel curves (p = 0.074), so the
-shared-slope model is a fair basis for the potency ratio.
+Here the F test finds no evidence against parallel curves (p = 0.705), so the
+shared-slope model is a fair basis for the potency ratios. Both intervals
+contain the simulated values (4 and 0.2).
 
-![parallel 4PL curves fitted jointly to three DNase runs](docs/images/multi.png)
+![parallel 4PL curves fitted jointly to a reference and two test samples](docs/images/multi.png)
 
 - **`fit.curves[c]`** is curve c as an ordinary `DrcFit`, so `ec50`, `ecxCI`,
   `predict` and the bands work on it. Its covariance is curve c's block of the
@@ -429,7 +435,9 @@ shared-slope model is a fair basis for the potency ratio.
   parameter, it is that parameter's variance).
 - **`fitMulti(model, …)`** is `fitLL4Multi` and its siblings with the model
   given as an argument.
-- **`relativePotency(a, b, pct = 50)`** is ECx of curve a over ECx of curve b.
+- **`relativePotency(a, b, pct = 50)`** is ECx of curve a over ECx of curve b,
+  so `relativePotency(reference, sample)` is the sample's potency relative to
+  the reference.
   Its interval comes from the delta method on log10 of the ratio, using the
   joint covariance, so it is asymmetric. R drc's `EDcomp` uses the ratio scale
   by default, which gives a symmetric interval.
