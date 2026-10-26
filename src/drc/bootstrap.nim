@@ -22,15 +22,12 @@ type
     resample*: Resample
 
 proc refitArgs(
-    model: Model,
-    fixed: set[DrcParam],
-    value: proc(param: DrcParam): float,
-    lower, upper: array[DrcParam, float],
+    model: Model, fixed: set[DrcParam], values, lower, upper: array[DrcParam, float]
 ): tuple[fixed: seq[(DrcParam, float)], bounds: seq[(DrcParam, Slice[float])]] =
   ## The `fixed` and `bounds` arguments that reproduce a fit's settings.
   for param in fixed:
     if param != Asymmetry or model == LL5: # 3PL and 4PL fix it themselves
-      result.fixed.add (param, value(param))
+      result.fixed.add (param, values[param])
   for param in DrcParam:
     if param notin fixed and (lower[param] > -Inf or upper[param] < Inf):
       result.bounds.add (param, lower[param] .. upper[param])
@@ -64,6 +61,61 @@ proc stripData(fit: var DrcFit) =
   fit.weights = @[]
   fit.robustWeights = @[]
 
+proc stripData(fit: var MultiFit) =
+  fit.data = default(typeof(fit.data))
+  for c in fit.curves.mitems:
+    c.stripData
+
+proc resampleFits[T](
+    boot: var Bootstrap[T],
+    n, seed: int,
+    doses, responses, weights, fitted: seq[float],
+    curve: seq[int],
+    nObs, df: int,
+    refit: proc(doses, responses, weights: seq[float], curve: seq[int]): T,
+) =
+  ## Adds refits of `n` resampled data sets to `boot`. `Residuals` adds
+  ## residuals drawn from every observation with non-zero weight to the
+  ## fitted values; `Cases` draws observations within each curve (a single
+  ## fit is all curve 0), so every curve keeps its size. Zero-weight
+  ## observations are left as they are (residuals) or out (cases).
+  var rng = initRand(seed)
+  var pool: seq[float]
+  var cases: seq[seq[int]] # each curve's observations with non-zero weight
+  if boot.resample == Residuals:
+    pool = residualPool(fitted, responses, weights, nObs, df)
+  else:
+    for i, c in curve:
+      if weights[i] > 0.0:
+        if c >= cases.len:
+          cases.setLen(c + 1)
+        cases[c].add i
+  for _ in 0 ..< n:
+    var d, y, w: seq[float]
+    var cs: seq[int]
+    if boot.resample == Residuals:
+      (d, y, w, cs) = (doses, responses, weights, curve)
+      for i in 0 ..< d.len:
+        if w[i] > 0.0:
+          y[i] = fitted[i] + pool[rng.rand(pool.high)] / sqrt(w[i])
+    else:
+      for c, rows in cases:
+        for _ in rows:
+          let i = rows[rng.rand(rows.high)]
+          d.add doses[i]
+          y.add responses[i]
+          w.add weights[i]
+          cs.add c
+    try:
+      var r = refit(d, y, w, cs)
+      if r.converged:
+        r.stripData
+        boot.replicates.add r
+      else:
+        inc boot.failed
+    except ValueError:
+      inc boot.failed
+
 proc bootstrap*(
     fit: DrcFit, n = 2000, resample = Residuals, seed = 1, opts = FitOptions()
 ): Bootstrap[DrcFit] =
@@ -72,8 +124,10 @@ proc bootstrap*(
   ## `Residuals`, the responses are the fitted values plus residuals
   ## √wⱼ·rⱼ drawn with replacement (centred and scaled by sqrt(n/df)),
   ## divided by √wᵢ; with `Cases`, observations are drawn with replacement.
-  ## Zero-weight observations are left as they are. Resampling is
-  ## reproducible for a given `seed`. Use `bootCI` for intervals.
+  ## Zero-weight observations are left as they are. Each refit starts from
+  ## `fit`'s estimates, with a full fit only if that does not converge.
+  ## Resampling is reproducible for a given `seed`. Use `bootCI` for
+  ## intervals.
   ##
   ## Residual resampling assumes the model and the weights are right; case
   ## resampling does not, but needs more data, since a resample can miss
@@ -90,46 +144,26 @@ proc bootstrap*(
   refitOpts.loss = fit.loss
   if fit.loss != Squared:
     refitOpts.tuning = fit.tuning
-  let (fixed, bounds) = refitArgs(
-    fit.model,
-    fit.fixed,
-    proc(param: DrcParam): float =
-      fit.params[param],
-    fit.lower,
-    fit.upper,
+  let
+    (fixed, bounds) = refitArgs(fit.model, fit.fixed, fit.params, fit.lower, fit.upper)
+    model = fit.model
+    start = fit.params.toVec
+  result.resampleFits(
+    n,
+    seed,
+    fit.doses,
+    fit.responses,
+    fit.weights,
+    fit.fitted,
+    newSeq[int](fit.doses.len),
+    fit.n,
+    fit.df,
+    proc(d, y, w: seq[float], curve: seq[int]): DrcFit =
+      result = fitCurveFrom(model, d, y, w, fixed, bounds, refitOpts, start, true)
+      if not result.converged:
+        result = fitCurve(model, d, y, w, fixed, bounds, refitOpts)
+    ,
   )
-  var rng = initRand(seed)
-  let fitted = fit.fitted
-  var pool: seq[float] # residuals, or the observations to draw from
-  var cases: seq[int]
-  if resample == Residuals:
-    pool = residualPool(fitted, fit.responses, fit.weights, fit.n, fit.df)
-  else:
-    for i in 0 ..< fit.doses.len:
-      if fit.weights[i] > 0.0:
-        cases.add i
-  for _ in 0 ..< n:
-    var doses, responses, weights: seq[float]
-    if resample == Residuals:
-      (doses, responses, weights) = (fit.doses, fit.responses, fit.weights)
-      for i in 0 ..< doses.len:
-        if weights[i] > 0.0:
-          responses[i] = fitted[i] + pool[rng.rand(pool.high)] / sqrt(weights[i])
-    else:
-      for _ in cases:
-        let i = cases[rng.rand(cases.high)]
-        doses.add fit.doses[i]
-        responses.add fit.responses[i]
-        weights.add fit.weights[i]
-    try:
-      var r = fitCurve(fit.model, doses, responses, weights, fixed, bounds, refitOpts)
-      if r.converged:
-        r.stripData
-        result.replicates.add r
-      else:
-        inc result.failed
-    except ValueError:
-      inc result.failed
 
 proc bootstrap*(
     fit: MultiFit, n = 2000, resample = Residuals, seed = 1, opts = FitOptions()
@@ -146,57 +180,32 @@ proc bootstrap*(
   checkReplicates(n)
   result.fit = fit
   result.resample = resample
-  let (fixed, bounds) = refitArgs(
-    fit.model,
-    fit.fixed,
-    proc(param: DrcParam): float =
-      fit.fixedValues[ord(param)],
-    fit.lower,
-    fit.upper,
-  )
-  let shared = fit.shared - fit.fixed
-  let data = fit.jointData
-  var fitted = newSeq[float](data.doses.len)
+  let
+    (fixed, bounds) =
+      refitArgs(fit.model, fit.fixed, fit.fixedValues.toParams, fit.lower, fit.upper)
+    model = fit.model
+    shared = fit.shared - fit.fixed
+    start = fit.joint
+  var fitted = newSeq[float](fit.curveIds.len)
   for i, c in fit.curveIds:
-    fitted[i] = fit.curves[c].predict(data.doses[i])
-  var rng = initRand(seed)
-  var pool: seq[float]
-  var cases = newSeq[seq[int]](fit.curves.len) # each curve's observations
-  if resample == Residuals:
-    pool = residualPool(fitted, data.responses, data.weights, fit.n, fit.df)
-  else:
-    for i, c in fit.curveIds:
-      if data.weights[i] > 0.0:
-        cases[c].add i
-  for _ in 0 ..< n:
-    var doses, responses, weights: seq[float]
-    var curve: seq[int]
-    if resample == Residuals:
-      (doses, responses, weights) = (data.doses, data.responses, data.weights)
-      curve = fit.curveIds
-      for i in 0 ..< doses.len:
-        if weights[i] > 0.0:
-          responses[i] = fitted[i] + pool[rng.rand(pool.high)] / sqrt(weights[i])
-    else:
-      for c, rows in cases:
-        for _ in rows:
-          let i = rows[rng.rand(rows.high)]
-          doses.add data.doses[i]
-          responses.add data.responses[i]
-          weights.add data.weights[i]
-          curve.add c
-    try:
-      var r = fitMulti(
-        fit.model, doses, responses, curve, shared, weights, fixed, bounds, opts
-      )
-      if r.converged:
-        for c in r.curves.mitems:
-          c.stripData
-        result.replicates.add r
-      else:
-        inc result.failed
-    except ValueError:
-      inc result.failed
+    fitted[i] = fit.curves[c].predict(fit.data.doses[i])
+  result.resampleFits(
+    n,
+    seed,
+    fit.data.doses,
+    fit.data.responses,
+    fit.data.weights,
+    fitted,
+    fit.curveIds,
+    fit.n,
+    fit.df,
+    proc(d, y, w: seq[float], curve: seq[int]): MultiFit =
+      result =
+        fitMultiFrom(model, d, y, curve, shared, w, fixed, bounds, opts, start, true)
+      if not result.converged:
+        result = fitMulti(model, d, y, curve, shared, w, fixed, bounds, opts)
+    ,
+  )
 
 proc bootValues*[T](boot: Bootstrap[T], statistic: proc(fit: T): float): seq[float] =
   ## `statistic` of each replicate, e.g. for a histogram.
@@ -235,8 +244,7 @@ proc bootCI*[T](
   ## (e.g. log dose). Replicates where the statistic is not finite are left
   ## out (see `bootValues`). With fewer than about 1000 replicates the ends
   ## of a 95% interval are noisy. NaN without any finite values.
-  if not (level > 0.0 and level < 1.0):
-    raise newException(ValueError, "confidence level must be in (0, 1), got " & $level)
+  checkLevel(level)
   var values: seq[float]
   for v in boot.bootValues(statistic):
     if v.isFinite:

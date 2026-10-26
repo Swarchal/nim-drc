@@ -108,6 +108,12 @@ proc checkDose(dose: float) =
   if not (dose >= 0.0 and dose < Inf):
     raise newException(ValueError, "dose must be finite and non-negative, got " & $dose)
 
+func logDoses(doses: openArray[float]): seq[float] =
+  ## x = log10(dose) for each dose (−Inf for a zero dose).
+  result = newSeq[float](doses.len)
+  for i, dose in doses:
+    result[i] = log10(dose)
+
 proc predict*(fit: DrcFit, dose: float): float =
   ## The fitted mean response at `dose` (0 gives the low-dose plateau).
   checkDose(dose)
@@ -119,9 +125,12 @@ proc predict*(fit: DrcFit, doses: openArray[float]): seq[float] =
   for dose in doses:
     result.add fit.predict(dose)
 
-proc tQuantile(fit: DrcFit, level: float): float =
+proc checkLevel(level: float) =
   if not (level > 0.0 and level < 1.0):
     raise newException(ValueError, "confidence level must be in (0, 1), got " & $level)
+
+proc tQuantile(fit: DrcFit, level: float): float =
+  checkLevel(level)
   studentTQuantile(0.5 + 0.5 * level, float(fit.df))
 
 func waldInterval(fit: DrcFit, param: DrcParam, tq: float): ConfInt =
@@ -136,36 +145,43 @@ proc checkPercent(pct: float) =
   if not (pct > 0.0 and pct < 100.0):
     raise newException(ValueError, "percentage must be in (0, 100), got " & $pct)
 
+func fractionAt(hill, pct: float): float =
+  ## The fraction sᴬ of the way from Bottom to Top at which a curve has made
+  ## `pct`% of its change from the low-dose plateau: pct/100 for a rising
+  ## curve and 1 − pct/100 for a falling one.
+  if hill > 0.0:
+    pct / 100.0
+  else:
+    1.0 - pct / 100.0
+
+func zOffset(r, a: float): tuple[z, dzdr, dzda: float] =
+  ## z = log10(r^(−1/A) − 1), with its derivatives. The curve is the fraction
+  ## r = sᴬ of the way from Bottom to Top, where s = 1/(1 + 10^z), at
+  ## z = (LogEC50 − x)·Hill, so at x = LogEC50 − z/Hill.
+  let
+    v = pow(r, -1.0 / a)
+    d = (v - 1.0) * ln(10.0)
+  (log10(v - 1.0), -v / (a * r * d), v * ln(r) / (a * a * d))
+
 func logDoseAtFraction(
     fit: DrcFit, r: float
 ): tuple[x, dxdr: float, grad: array[DrcParam, float]] =
   ## The log10 dose x at which the curve is the fraction r = sᴬ of the way
-  ## from Bottom to Top, where s = 1/(1 + 10^z) and z = (LogEC50 − x)·Hill,
-  ## with ∂x/∂r and the gradient of x with respect to LogEC50, Hill and
-  ## Asymmetry. Solving gives x = LogEC50 − z/Hill with z = log10(r^(−1/A) − 1).
+  ## from Bottom to Top (see `zOffset`), with ∂x/∂r and the gradient of x
+  ## with respect to LogEC50, Hill and Asymmetry.
   let
     h = fit.params[Hill]
-    a = fit.params[Asymmetry]
-    v = pow(r, -1.0 / a)
-    z = log10(v - 1.0)
+    (z, dzdr, dzda) = zOffset(r, fit.params[Asymmetry])
   result.x = fit.params[LogEC50] - z / h
-  result.dxdr = v / (a * r * (v - 1.0) * ln(10.0) * h)
+  result.dxdr = -dzdr / h
   result.grad[LogEC50] = 1.0
   result.grad[Hill] = z / (h * h)
-  result.grad[Asymmetry] = -v * ln(r) / (a * a * (v - 1.0) * ln(10.0) * h)
+  result.grad[Asymmetry] = -dzda / h
 
 func logEcxAndGradient(fit: DrcFit, pct: float): (float, array[DrcParam, float]) =
-  ## log10(ECx) and its gradient with respect to the parameters.
-  ##
-  ## The fraction of the change from the low-dose plateau is sᴬ for a rising
-  ## curve and 1 − sᴬ for a falling one, so r = pct/100 (rising) or
-  ## 1 − pct/100 (falling). It does not depend on Bottom or Top.
-  let r =
-    if fit.params[Hill] > 0.0:
-      pct / 100.0
-    else:
-      1.0 - pct / 100.0
-  let at = fit.logDoseAtFraction(r)
+  ## log10(ECx) and its gradient with respect to the parameters. It does not
+  ## depend on Bottom or Top.
+  let at = fit.logDoseAtFraction(fractionAt(fit.params[Hill], pct))
   (at.x, at.grad)
 
 func logDoseAtAndGradient(
@@ -182,8 +198,7 @@ func logDoseAtAndGradient(
   if not (r > 0.0 and r < 1.0) or fit.params[Hill] == 0.0:
     result.x = NaN
     result.dxdy = NaN
-    for param in DrcParam:
-      result.grad[param] = NaN
+    result.grad.fill(NaN)
     return
   let at = fit.logDoseAtFraction(r)
   # r = (response − Bottom)/(Top − Bottom), so ∂r/∂Bottom = −(1 − r)/(Top − Bottom)
@@ -428,8 +443,8 @@ proc profileEnd[F, V, B](
     free: B,
     lower, upper: V,
     ssrHat, sigma, tq, step, direction: float,
+    positive: bool,
     lm: LMOptions,
-    asymmetrySlot = ord(Asymmetry),
 ): float =
   ## One end of a profile-likelihood interval: the value β of parameter j,
   ## beyond pHat[j] in `direction` (±1), at which τ(β) reaches `tq`. It steps
@@ -437,16 +452,15 @@ proc profileEnd[F, V, B](
   ## `tq`, then finds the crossing by the Illinois method. Each refit starts
   ## from the nearest point inside the crossing, so the profile follows one
   ## valley. If τ stays below `tq` up to a bound, the bound is the end (0 for
-  ## Asymmetry, which must be positive: `asymmetrySlot` says where it is, or
-  ## −1 if parameter j is not an Asymmetry). As R's `profile.nls`, the profile is
-  ## followed only to 10·`tq` steps from the estimate, and if τ has not
+  ## a `positive` parameter, i.e. Asymmetry). As R's `profile.nls`, the
+  ## profile is followed only to 10·`tq` steps from the estimate, and if τ has not
   ## reached `tq` by then the end is ±Inf (a finite bound beyond that is
   ## still tried): far out, the refits are poorly conditioned (on a partial
   ## curve, a plateau runs off to infinity) and can stop short of the
   ## minimum, which would look like a crossing.
   var pinned = free
   pinned[j] = false
-  let open = j == asymmetrySlot and direction < 0.0 and not (lower[j] > 0.0)
+  let open = positive and direction < 0.0 and not (lower[j] > 0.0)
   let limit =
     if direction > 0.0:
       upper[j]
@@ -515,6 +529,37 @@ proc profileEnd[F, V, B](
       side = 1
   0.5 * (a + b)
 
+proc profileInterval[F, V, B](
+    fn: F,
+    x, y, w: openArray[float],
+    pHat: V,
+    j: int,
+    free: B,
+    lower, upper: V,
+    ssrHat, sigma, tq, se: float,
+    positive: bool,
+    lm: LMOptions,
+): ConfInt =
+  ## Both ends of the profile-likelihood interval for parameter j (see
+  ## `profileEnd`), stepping out by its standard error `se`, or by
+  ## 0.1·max(|estimate|, 1) if that is unusable. NaN without a usable σ.
+  if not (sigma > 0.0 and sigma < Inf):
+    return (NaN, NaN)
+  let step =
+    if se > 0.0 and se < Inf:
+      se
+    else:
+      0.1 * max(abs(pHat[j]), 1.0)
+  for k, direction in [-1.0, 1.0]:
+    let bound = profileEnd(
+      fn, x, y, w, pHat, j, free, lower, upper, ssrHat, sigma, tq, step, direction,
+      positive, lm,
+    )
+    if k == 0:
+      result.lower = bound
+    else:
+      result.upper = bound
+
 proc checkProfile(fit: DrcFit) =
   if fit.loss != Squared:
     raise
@@ -528,19 +573,10 @@ proc checkProfile(fit: DrcFit) =
 proc profileData(
     fit: DrcFit
 ): tuple[x: seq[float], free: array[drcParamCount, bool], box: Box] =
-  result.x = newSeq[float](fit.doses.len)
-  for i, dose in fit.doses:
-    result.x[i] = log10(dose)
+  result.x = logDoses(fit.doses)
   for param in DrcParam:
     result.free[ord(param)] = param notin fit.fixed
   result.box = (fit.lower.toVec, fit.upper.toVec)
-
-proc profileStep(fit: DrcFit, param: DrcParam): float =
-  ## The first step out from the estimate: its standard error, if usable.
-  if fit.se[param] > 0.0 and fit.se[param] < Inf:
-    fit.se[param]
-  else:
-    0.1 * max(abs(fit.params[param]), 1.0)
 
 proc profileCI*(
     fit: DrcFit, param: DrcParam, level = 0.95, opts = FitOptions()
@@ -552,38 +588,32 @@ proc profileCI*(
   ## the Wald interval (`confint`), it follows the curvature of the SSR, so
   ## it can be asymmetric. An end is a bound if the data do not exclude the
   ## bound (0 for Asymmetry), and ±Inf if the data do not bound the
-  ## parameter within 10·t standard errors of the estimate (where R gives NA). A fixed parameter's interval is its value; NaN without
-  ## residual degrees of freedom. `opts.lm` controls the refits.
-  ## Least-squares fits only, and not for the curves of a joint fit.
+  ## parameter within 10·t standard errors of the estimate (where R gives
+  ## NA). A fixed parameter's interval is its value; NaN without residual
+  ## degrees of freedom. `opts.lm` controls the refits. Least-squares fits
+  ## only, and not for the curves of a joint fit.
   fit.checkProfile
   let tq = fit.tQuantile(level)
-  let v = fit.params[param]
   if param in fit.fixed:
-    return (v, v)
-  if not (fit.sigma > 0.0 and fit.sigma < Inf):
-    return (NaN, NaN)
+    return (fit.params[param], fit.params[param])
   let (x, free, box) = fit.profileData
-  let step = fit.profileStep(param)
-  var bounds: array[2, float]
-  for k, direction in [-1.0, 1.0]:
-    bounds[k] = profileEnd(
-      ll5,
-      x,
-      fit.responses,
-      fit.weights,
-      fit.params.toVec,
-      ord(param),
-      free,
-      box.lower,
-      box.upper,
-      fit.ssr,
-      fit.sigma,
-      tq,
-      step,
-      direction,
-      opts.lm,
-    )
-  (bounds[0], bounds[1])
+  profileInterval(
+    ll5,
+    x,
+    fit.responses,
+    fit.weights,
+    fit.params.toVec,
+    ord(param),
+    free,
+    box.lower,
+    box.upper,
+    fit.ssr,
+    fit.sigma,
+    tq,
+    fit.se[param],
+    param == Asymmetry,
+    opts.lm,
+  )
 
 proc ecxProfileCI*(
     fit: DrcFit, pct: float, level = 0.95, opts = FitOptions()
@@ -599,57 +629,45 @@ proc ecxProfileCI*(
     raise newException(ValueError, "LogEC50 is fixed, so ECx cannot be profiled")
   if fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
     raise newException(ValueError, "LogEC50 is bounded, so ECx cannot be profiled")
-  if not (fit.sigma > 0.0 and fit.sigma < Inf):
-    return (NaN, NaN)
-  let r =
-    if fit.params[Hill] > 0.0:
-      pct / 100.0
-    else:
-      1.0 - pct / 100.0
-  # q is the parameter vector with q[LogEC50] = log10(ECx). From
-  # `logDoseAtFraction`, LogEC50 = log10(ECx) + z/Hill, z = log10(r^(−1/A) − 1).
+  let r = fractionAt(fit.params[Hill], pct)
+  # q is the parameter vector with q[LogEC50] = log10(ECx), so
+  # LogEC50 = log10(ECx) + z/Hill (see `zOffset`). z depends only on
+  # Asymmetry, so it is kept between calls.
+  var cachedA = NaN
+  var z, dzda: float
   let model = proc(x: float, q: ParamVec, grad: var ParamVec): float =
-    let
-      h = q[ord(Hill)]
-      a = q[ord(Asymmetry)]
-      v = pow(r, -1.0 / a)
-      z = log10(v - 1.0)
+    let (h, a) = (q[ord(Hill)], q[ord(Asymmetry)])
+    if a != cachedA:
+      let o = zOffset(r, a)
+      (z, dzda, cachedA) = (o.z, o.dzda, a)
     var p = q
     p[ord(LogEC50)] = q[ord(LogEC50)] + z / h
     result = ll5(x, p, grad)
     let dl = grad[ord(LogEC50)]
     grad[ord(Hill)] -= dl * z / (h * h)
-    grad[ord(Asymmetry)] += dl * v * ln(r) / (a * a * (v - 1.0) * ln(10.0) * h)
+    grad[ord(Asymmetry)] += dl * dzda / h
   let (x, free, box) = fit.profileData
   var q = fit.params.toVec
   let (logEcx, grad) = fit.logEcxAndGradient(pct)
   q[ord(LogEC50)] = logEcx
-  var step = sqrt(fit.deltaVariance(grad, LogEC50 .. Asymmetry))
-  if not (step > 0.0 and step < Inf):
-    step = 0.1
-  var bounds: array[2, float]
-  for k, direction in [-1.0, 1.0]:
-    bounds[k] = pow(
-      10.0,
-      profileEnd(
-        model,
-        x,
-        fit.responses,
-        fit.weights,
-        q,
-        ord(LogEC50),
-        free,
-        box.lower,
-        box.upper,
-        fit.ssr,
-        fit.sigma,
-        tq,
-        step,
-        direction,
-        opts.lm,
-      ),
-    )
-  (bounds[0], bounds[1])
+  let ci = profileInterval(
+    model,
+    x,
+    fit.responses,
+    fit.weights,
+    q,
+    ord(LogEC50),
+    free,
+    box.lower,
+    box.upper,
+    fit.ssr,
+    fit.sigma,
+    tq,
+    sqrt(fit.deltaVariance(grad, LogEC50 .. Asymmetry)),
+    false,
+    opts.lm,
+  )
+  (pow(10.0, ci.lower), pow(10.0, ci.upper))
 
 proc ec50ProfileCI*(fit: DrcFit, level = 0.95, opts = FitOptions()): ConfInt =
   fit.ecxProfileCI(50.0, level, opts)
@@ -835,28 +853,19 @@ proc resolveBounds(
       )
     (result.lower[ord(param)], result.upper[ord(param)]) = (range.a, range.b)
 
-proc fitCurve*(
+proc fitCurveFrom(
     model: Model,
     doses, responses: openArray[float],
-    weights: openArray[float] = [],
-    fixed: openArray[(DrcParam, float)] = [],
-    bounds: openArray[(DrcParam, Slice[float])] = [],
-    opts = FitOptions(),
+    weights: openArray[float],
+    fixed: openArray[(DrcParam, float)],
+    bounds: openArray[(DrcParam, Slice[float])],
+    opts: FitOptions,
+    start: ParamVec,
+    warm: bool,
 ): DrcFit =
-  ## Fits `model` to `responses` at `doses` (linear scale; zero doses are
-  ## treated as untreated controls). `fitLL3`, `fitLL4` and `fitLL5` are
-  ## this with the model given.
-  ##
-  ## * `weights` are relative: the error variance of observation i is taken
-  ##   to be σ²/wᵢ, with σ² estimated from the fit. A weight of 0 excludes
-  ##   an observation.
-  ## * Parameters in `fixed` are held at the given value. A 3PL fixes Bottom
-  ##   at 0 unless `fixed` gives it; 3PL and 4PL fits fix Asymmetry at 1.
-  ## * Parameters in `bounds` are kept within their range, e.g.
-  ##   `bounds = [(Hill, -10.0 .. -0.1), (Top, -Inf .. 120.0)]`. A parameter
-  ##   that ends on a bound is listed in `fit.atBound` and raises `fwAtBound`;
-  ##   its standard error is computed as if it were unbounded, as R's
-  ##   `nls(algorithm = "port")` does.
+  ## `fitCurve`, or with `warm`, one Levenberg–Marquardt run from `start`
+  ## in place of the guess and multi-start search (the fallback still
+  ## applies); for refits of data close to an earlier fit's.
   result.model = model
   if doses.len != responses.len:
     raise newException(ValueError, "doses and responses differ in length")
@@ -864,13 +873,13 @@ proc fitCurve*(
     raise newException(ValueError, "weights and doses differ in length")
 
   var
-    x, w = newSeq[float](doses.len)
+    x = logDoses(doses)
+    w = newSeq[float](doses.len)
     guessX, guessY: seq[float] # observations with non-zero weight
     sumW, sumWY, sumLogW = 0.0
     lo = Inf
     hi = NegInf
   for i in 0 ..< doses.len:
-    x[i] = log10(doses[i])
     w[i] =
       if weights.len == 0:
         1.0
@@ -933,10 +942,18 @@ proc fitCurve*(
         "non-zero weight to fit " & $nFree & " parameters, got " & $result.n,
     )
 
-  var p0 = drcGuess(guessX, guessY, fixedValues, result.fixed)
+  var p0 =
+    if warm:
+      start
+    else:
+      drcGuess(guessX, guessY, fixedValues, result.fixed)
   for j in 0 ..< drcParamCount:
     p0[j] = clamp(p0[j], box.lower[j], box.upper[j])
-  var best = searchLM(x, responses, w, p0, free, box, opts)
+  var best =
+    if warm:
+      levenbergMarquardt(ll5, x, responses, w, p0, free, box.lower, box.upper, opts.lm)
+    else:
+      searchLM(x, responses, w, p0, free, box, opts)
   result.converged = best.status.converged
   if opts.fallback and not result.converged:
     # Nelder–Mead needs no derivatives; Levenberg–Marquardt then polishes its result.
@@ -1079,6 +1096,32 @@ proc fitCurve*(
   else:
     # A robust fit does not maximise the Gaussian likelihood.
     (result.logLik, result.aic, result.bic) = (NaN, NaN, NaN)
+
+proc fitCurve*(
+    model: Model,
+    doses, responses: openArray[float],
+    weights: openArray[float] = [],
+    fixed: openArray[(DrcParam, float)] = [],
+    bounds: openArray[(DrcParam, Slice[float])] = [],
+    opts = FitOptions(),
+): DrcFit =
+  ## Fits `model` to `responses` at `doses` (linear scale; zero doses are
+  ## treated as untreated controls). `fitLL3`, `fitLL4` and `fitLL5` are
+  ## this with the model given.
+  ##
+  ## * `weights` are relative: the error variance of observation i is taken
+  ##   to be σ²/wᵢ, with σ² estimated from the fit. A weight of 0 excludes
+  ##   an observation.
+  ## * Parameters in `fixed` are held at the given value. A 3PL fixes Bottom
+  ##   at 0 unless `fixed` gives it; 3PL and 4PL fits fix Asymmetry at 1.
+  ## * Parameters in `bounds` are kept within their range, e.g.
+  ##   `bounds = [(Hill, -10.0 .. -0.1), (Top, -Inf .. 120.0)]`. A parameter
+  ##   that ends on a bound is listed in `fit.atBound` and raises `fwAtBound`;
+  ##   its standard error is computed as if it were unbounded, as R's
+  ##   `nls(algorithm = "port")` does.
+  fitCurveFrom(
+    model, doses, responses, weights, fixed, bounds, opts, default(ParamVec), false
+  )
 
 proc fitLL4*(
     doses, responses: openArray[float],

@@ -13,7 +13,7 @@ nim c -r --hints:off --path:src tests/tfit.nim "fitLL4: ryegrass reference::zero
 nim c -r -d:release --path:src <file>.nim          # benchmarks / timing
 ```
 
-`nimble test` stops at the first failing file, so a failure can hide later files. `tests/tbootstrap.nims` compiles that one test in release mode, since it runs thousands of refits. Compiled test binaries land next to their sources in `tests/`.
+`nimble test` stops at the first failing file, so a failure can hide later files. Compiled test binaries land next to their sources in `tests/`.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ The layers, from bottom to top:
 - `src/drc/models.nim`: **one model, `ll5`** (five-parameter logistic in x = log10 dose), plus `drcGuess` for starting values.
 - `src/drc.nim`: public API. `fitCurve(model, …)` returns a `DrcFit`, and `fitLL3`/`fitLL4`/`fitLL5` are one-line wrappers over it with identical arguments. For LL3, `resolveFixed` adds Bottom = 0 unless `fixed` gives Bottom.
 - `src/drc/multi.nim`: joint fits of several curves (`fitMulti(model, …)` and the `fitLL4Multi` etc. wrappers → `MultiFit`; `param`/`cov` accessors; `relativePotency`, `fTest`). It is `include`d at the end of `drc.nim` (not imported), so it can use that module's private helpers (`fitCurve`, `logEcxAndGradient`, `tQuantile`, `resolveFixed`, …).
-- `src/drc/bootstrap.nim`: `bootstrap` for `DrcFit` and `MultiFit` → generic `Bootstrap[T]`, and `bootCI` (percentile, as `boot.ci(type = "perc")`). It is `include`d after `multi.nim`, for the same reason.
+- `src/drc/bootstrap.nim`: `bootstrap` for `DrcFit` and `MultiFit` → generic `Bootstrap[T]` (one resampling core, `resampleFits`), and `bootCI` (percentile, as `boot.ci(type = "perc")`). Refits start from the original estimates with one LM run (the private `fitCurveFrom`/`fitMultiFrom` with `warm`), falling back to a full fit if that does not converge. It is `include`d after `multi.nim`, for the same reason.
 
 Design decisions that span files:
 

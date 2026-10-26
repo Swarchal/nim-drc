@@ -1,6 +1,7 @@
 import std/[math, sequtils, unittest]
 import drc
 import ryegrass
+import fixtures
 
 # Bootstrap draws cannot match R's random numbers, so the resampling is
 # checked against the same scheme written independently in R with 20,000
@@ -142,20 +143,8 @@ suite "bootstrap: ryegrass 4PL":
       discard fitLL4([0.1, 1.0, 10.0, 100.0], [1.0, 3.0, 8.0, 9.0]).bootstrap(n = 5)
 
 suite "bootstrap: joint fits":
-  let response = [
-    0.037, 0.07, 0.059, 0.157, 0.207, 0.161, 0.498, 0.508, 1.048, 1.013, 1.632, 1.587,
-    1.832, 1.768, 2.002, 1.956, 1.987, 2.026, 0.138, 0.129, 0.269, 0.263, 0.574, 0.492,
-    1.175, 1.148, 1.645, 1.593, 1.868, 1.904, 2.021, 1.963, 2.006, 1.988, 1.942, 1.981,
-    0.036, 0.05, 0.101, 0.088, 0.069, 0.066, 0.167, 0.162, 0.306, 0.305, 0.799, 0.815,
-    1.375, 1.415, 1.789, 1.749, 1.944, 1.885,
-  ]
-  var doses: seq[float]
-  var curve: seq[int]
-  for c in 0 .. 2:
-    for k in 0 .. 8:
-      let dose = pow(10.0, -2.0 + 0.5 * float(k))
-      doses.add [dose, dose]
-      curve.add [c, c]
+  let (doses, curve) = potencyDesign()
+  const response = potencyResponse
   let fit = fitLL4Multi(doses, response, curve, shared = {Bottom, Top, Hill})
   proc potency(f: MultiFit): float =
     f.relativePotency(0, 1).ratio

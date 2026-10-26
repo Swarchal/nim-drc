@@ -371,7 +371,8 @@ or partial curves, as in the profile example above.
   Non-finite values (e.g. `doseAt` outside a refit's range) are left out.
 - **`n`** defaults to 2000. Use at least 1000 for a 95% interval, since its
   ends rest on the extreme 2.5% of refits. `seed` makes the resampling
-  reproducible. 2000 refits of a 4PL take about half a second.
+  reproducible. Each refit starts from the original estimates, so 2000
+  refits of a 4PL take about 40 ms.
 - **Joint fits:** `bootstrap(multiFit)` works the same way. Residuals are
   drawn from all curves together (the fit has one σ), and cases within each
   curve. See the potency example below.

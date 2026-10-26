@@ -1,6 +1,7 @@
 import std/[math, unittest]
 import drc
 import ryegrass
+import fixtures
 
 # References from R: nls() fits in x = log10(dose), the dose x₀ where the
 # fitted curve equals y₀ found by uniroot (and checked against the closed
@@ -76,20 +77,6 @@ suite "inverse prediction: ryegrass 4PL":
       discard fit.calibrationCI(4.0, replicates = 0)
 
 suite "inverse prediction: 5PL":
-  const
-    asymDose = [
-      0.0, 0.0, 1e-09, 1e-09, 3.1622776601683795e-09, 3.1622776601683795e-09, 1e-08,
-      1e-08, 3.162277660168379e-08, 3.162277660168379e-08, 1e-07, 1e-07,
-      3.162277660168379e-07, 3.162277660168379e-07, 1e-06, 1e-06, 3.162277660168379e-06,
-      3.162277660168379e-06, 1e-05, 1e-05, 3.1622776601683795e-05,
-      3.1622776601683795e-05, 0.0001, 0.0001, 0.00031622776601683794,
-      0.00031622776601683794, 0.001, 0.001,
-    ]
-    asymResponse = [
-      5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38, 37.01, 36.75, 54.87,
-      52.8, 75.55, 77.0, 86.17, 87.94, 89.67, 90.89, 90.97, 94.18, 92.39, 95.46, 95.3,
-      94.61, 89.96, 93.92,
-    ]
   let fit = fitLL5(asymDose, asymResponse)
 
   test "dose at a response and its intervals match R":
@@ -138,12 +125,6 @@ suite "inverse prediction: special cases":
     check close(fit.doseAtCI(50.0).upper, fit.ec50CI.upper, 1e-10)
 
   test "curve views of a joint fit support inverse prediction":
-    var doses, resp: seq[float]
-    var curve: seq[int]
-    for c in 0 .. 1:
-      for i, d in ryegrassDose:
-        doses.add d * (if c == 0: 1.0 else: 4.0)
-        resp.add ryegrassRootLength[i]
-        curve.add c
+    let (doses, resp, curve) = ryegrassCurves(4.0)
     let fit = fitLL4Multi(doses, resp, curve, shared = {Bottom, Top, Hill})
     check close(fit.curves[1].doseAt(4.0) / fit.curves[0].doseAt(4.0), 4.0, 1e-6)
