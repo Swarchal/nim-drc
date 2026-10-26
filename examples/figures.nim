@@ -5,161 +5,19 @@
 ## `nimble figures` finds it through `--path`. PNG output also needs
 ## `vl-convert` on PATH.
 ##
+## The plotting helpers (`doseAxis`, `curveLines`, `dots`, `finish`, …) are in
+## `vignettes/drcplot.nim`, which the vignettes share.
+##
 ## Each figure proc does three things, in order:
 ##
 ## 1. **Data and fit.** These are copied from the matching README example, so
 ##    the figure shows exactly the fit that the README prints.
 ## 2. **Dose axis.** The dose range to show, and the unit to show it in.
 ## 3. **Layers.** Built one per `let` and stacked bottom to top by `layer`.
-##
-## The helpers turn fits and observations into data frames and chart layers.
-## Every data frame has the same three columns: `dose`, `response` and `series`.
 
 import std/[math, os, sequtils, strformat]
 import drc
-import plotter
-
-# ----------------------------------------------------------------- style ----
-
-const
-  width = 520
-  height = 320
-  pngScale = 2.0 # render at twice the size, for high-DPI screens
-  # The first three categorical slots, which stay distinguishable under
-  # colour-vision deficiency even when every pair is on screen at once.
-  blue = "#2a78d6"
-  orange = "#eb6834"
-  aqua = "#1baf7a"
-  ink = "#52514e" # observations and annotations
-  muted = "#9a9893" # reference lines
-  dotSize = 40 # area in px², as Vega-Lite measures point size
-
-# ------------------------------------------------------------- dose axis ----
-
-type DoseAxis = object
-  ## A log10 dose axis. A fit uses whatever dose unit it was given (e.g. molar);
-  ## the axis shows each dose multiplied by `fittedToDisplay` (1e9 shows molar
-  ## as nM). `lo` and `hi` are the ends of the axis, in display units.
-  title: string
-  lo, hi: float
-  fittedToDisplay: float
-
-proc doseAxis(title: string, lo, hi: float, fittedToDisplay = 1.0): DoseAxis =
-  DoseAxis(title: title, lo: lo, hi: hi, fittedToDisplay: fittedToDisplay)
-
-proc toDisplay(a: DoseAxis, fittedDose: float): float =
-  fittedDose * a.fittedToDisplay
-
-proc x(a: DoseAxis): Encoding =
-  ## The x encoding: a log scale over exactly [lo, hi], with ticks only at
-  ## whole decades. The 1e-9 keeps an end that is already a decade, such as
-  ## 1e3, from being rounded past.
-  let firstDecade = int(ceil(log10(a.lo) - 1e-9))
-  let lastDecade = int(floor(log10(a.hi) + 1e-9))
-  var ticks: seq[Value]
-  for e in firstDecade .. lastDecade:
-    ticks.add v(pow(10.0, float(e)))
-  "dose:Q".scale(scaleType = scLog, domain = @[v(a.lo), v(a.hi)], nice = false).axis(
-    title = a.title, grid = false, values = ticks, format = "~g"
-  )
-
-proc doseGrid(a: DoseAxis, n = 200): seq[float] =
-  ## n doses across the whole axis, evenly spaced in log10. They are in
-  ## *fitted* units, ready to pass to `predict` or a band.
-  let lo = log10(a.lo / a.fittedToDisplay)
-  let hi = log10(a.hi / a.fittedToDisplay)
-  for i in 0 ..< n:
-    result.add pow(10.0, lo + (hi - lo) * float(i) / float(n - 1))
-
-# ----------------------------------------------------------- data frames ----
-
-type Series = object ## A fitted curve and its legend label.
-  label: string
-  fit: DrcFit
-
-proc series(label: string, fit: DrcFit): Series =
-  Series(label: label, fit: fit)
-
-proc curveFrame(a: DoseAxis, curves: openArray[Series]): DataFrame =
-  ## Each curve's predicted response across the axis, one row per point, with
-  ## the curves stacked one after another.
-  var dose, response: seq[float]
-  var label: seq[string]
-  for curve in curves:
-    for d in a.doseGrid:
-      dose.add a.toDisplay(d)
-      response.add curve.fit.predict(d)
-      label.add curve.label
-  dataFrame(col("dose", dose), col("response", response), col("series", label))
-
-proc observationFrame(
-    a: DoseAxis,
-    doses, responses: openArray[float],
-    labels: openArray[string] = [],
-    keep: openArray[bool] = [],
-): DataFrame =
-  ## The observations to plot, one row each. `labels` gives each observation's
-  ## series (default: none), and `keep` selects which observations to include
-  ## (default: all). Zero doses cannot sit on a log axis, so they are always
-  ## left out, but the fits still use them.
-  var dose, response: seq[float]
-  var label: seq[string]
-  for i, d in doses:
-    let wanted = keep.len == 0 or keep[i]
-    if d > 0 and wanted:
-      dose.add a.toDisplay(d)
-      response.add responses[i]
-      label.add (if labels.len > 0: labels[i] else: "")
-  dataFrame(col("dose", dose), col("response", response), col("series", label))
-
-# ---------------------------------------------------------------- layers ----
-
-proc seriesColors(labels, colors: openArray[string], legendAt: string): Encoding =
-  ## Colour by series, giving each label a fixed colour, so that a series keeps
-  ## its colour wherever it appears. `legendAt` is a Vega-Lite legend `orient`.
-  "series:N".scale(domain = labels.mapIt(v(it)), range = colors.mapIt(v(it))).legend(
-    title = "", orient = legendAt
-  )
-
-proc curveLines(
-    a: DoseAxis, curves: openArray[Series], yTitle: string, color: Encoding
-): Chart =
-  ## One line per fitted curve. This layer also sets the y-axis title.
-  chart(a.curveFrame(curves)).markLine(strokeWidth = 2).encode(
-    x = a.x, y = "response:Q".title(yTitle), color = color
-  )
-
-proc dots(a: DoseAxis, observations: DataFrame): Chart =
-  ## Observations as solid grey dots.
-  chart(observations).markPoint(filled = true, color = ink, size = dotSize).encode(
-    x = a.x, y = "response:Q"
-  )
-
-proc seriesDots(a: DoseAxis, observations: DataFrame, color: Encoding): Chart =
-  ## Observations as solid dots, coloured by series.
-  chart(observations).markPoint(filled = true, size = dotSize, opacity = 0.9).encode(
-    x = a.x, y = "response:Q", color = color
-  )
-
-proc crosses(a: DoseAxis, observations: DataFrame): Chart =
-  ## Observations as open grey ×s, for points that a fit has rejected.
-  chart(observations)
-    .markPoint(
-      filled = false,
-      color = ink,
-      size = 90,
-      strokeWidth = 1.5,
-      raw = %*{"shape": "cross", "angle": 45},
-    )
-    .encode(x = a.x, y = "response:Q")
-
-proc finish(c: Chart, title: string): Chart =
-  ## The size, title and styling that every figure shares.
-  c
-    .properties(width = width, height = height, title = title)
-    .configureBackground("#ffffff")
-    .configureView(noStroke = true)
-    .configureAxis(gridColor = "#eeeeee")
+import drcplot
 
 # --------------------------------------------------------------- figures ----
 
@@ -236,7 +94,8 @@ proc asymmetricFigure(): Chart =
   let axis = doseAxis("Dose (µM)", 7e-4, 1.5e3, fittedToDisplay = 1e6)
 
   let curves = [
-    series(&"4PL (AIC {four.aic:.1f})", four), series(&"5PL (AIC {five.aic:.1f})", five)
+    labelled(&"4PL (AIC {four.aic:.1f})", four),
+    labelled(&"5PL (AIC {five.aic:.1f})", five),
   ]
   let color =
     seriesColors(curves.mapIt(it.label), [orange, blue], legendAt = "top-left")
@@ -259,10 +118,10 @@ proc robustFigure(): Chart =
     91.24, 77.88, 76.72, 75.56, 48.83, 16.45, 49.28, 24.15, 20.67, 21.35, 12.34, 9.33,
     6.18, 2.95, 35.12, 9.3, 1.57, 1.65, 5.39, -0.56, 1.22, 4.74,
   ]
-  var curves: seq[Series]
+  var curves: seq[LabelledFit]
   for loss in [Squared, Huber, Tukey]:
     let fit = fitLL4(doses, activity, opts = FitOptions(loss: loss))
-    curves.add series(&"{loss} (IC50 {round(fit.ec50 * 1e9).int} nM)", fit)
+    curves.add labelled(&"{loss} (IC50 {round(fit.ec50 * 1e9).int} nM)", fit)
 
   # Tukey's bisquare gives weight exactly 0 to a residual beyond its cut-off,
   # so these observations play no part in the Tukey fit.
@@ -307,9 +166,9 @@ proc multiFigure(): Chart =
 
   # `parallel.curves[c]` is curve c's own fit, so it plots like any other.
   let samples = ["reference", "sample A", "sample B"]
-  var curves: seq[Series]
+  var curves: seq[LabelledFit]
   for c, sample in samples:
-    curves.add series(sample, parallel.curves[c])
+    curves.add labelled(sample, parallel.curves[c])
   let sampleOfObservation = curve.mapIt(samples[it])
   let color = seriesColors(samples, [blue, orange, aqua], legendAt = "top-left")
 

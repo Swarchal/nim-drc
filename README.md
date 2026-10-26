@@ -22,7 +22,15 @@ Requires Nim ≥ 2.0. From a clone of this repository:
 nimble install    # or: nimble develop
 nimble test       # run the test suite
 nimble figures    # re-render the README figures (needs nim-plotter and vl-convert)
+nimble vignettes  # re-render the vignettes (likewise)
 ```
+
+## Vignettes
+
+Longer worked examples, with figures, are in
+[`docs/vignettes`](docs/vignettes/README.md): getting started, choosing a
+model, confidence intervals, outliers and robust fitting, relative potency,
+standard curves, and fitting a compound screen.
 
 ## The models
 

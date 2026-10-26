@@ -1,0 +1,235 @@
+## Render the vignettes to Markdown, in `docs/vignettes/`.
+##
+## A vignette is an ordinary Nim program written in a literate style: lines
+## that start with `## ` (or are just `##`) at column 0 are Markdown prose, and
+## every run of other lines between them is a code chunk. This program runs
+## each vignette once and writes a Markdown file with each chunk's code
+## followed by what it printed, so the output shown is always real.
+##
+## - Code from a `#| hide` line (at column 0) up to the next prose or
+##   `#| hide` line runs but is not shown, for set-up that would distract
+##   from the text (e.g. long data literals that an earlier vignette already
+##   showed).
+## - `figure(chart, name, alt)` from `drcplot` renders a chart to a PNG in
+##   `docs/vignettes/figures/<vignette>/` and becomes an image link in the
+##   output, at the point where it was called.
+## - Prose and `#| hide` lines must not split a statement: each chunk has to
+##   end at top level.
+##
+## Usage: `nimble vignettes`, or `nim c -r vignettes/knit.nim [name ...]` to
+## render only some (e.g. `intervals`). The vignettes use `plotter`, found
+## through `$PLOTTER_PATH` (default `../nim-plotter/src`), and need
+## `vl-convert` on PATH.
+
+import std/[os, osproc, sequtils, strformat, strutils, tempfiles]
+
+const
+  # In reading order. Each is `vignettes/<name>.nim`.
+  vignettes = [
+    "getting_started", "model_choice", "intervals", "outliers", "potency",
+    "standard_curves", "screening",
+  ]
+  chunkMarker = "\x1Echunk "
+  figureMarker = "\x1Dfigure " # printed by `drcplot.figure`
+  hideOption = "#| hide"
+
+type Chunk = object
+  prose: bool
+  hidden: bool
+  lines: seq[string]
+
+proc isProse(line: string): bool =
+  line == "##" or line.startsWith("## ")
+
+proc trimBlank(lines: seq[string]): seq[string] =
+  ## `lines` without leading or trailing blank lines.
+  var (a, b) = (0, lines.high)
+  while a <= b and lines[a].strip.len == 0:
+    inc a
+  while b >= a and lines[b].strip.len == 0:
+    dec b
+  lines[a .. b]
+
+proc parse(source: string): seq[Chunk] =
+  for line in source.splitLines:
+    let prose = line.isProse
+    # A `#| hide` line starts a chunk of its own, even straight after code.
+    let hide = not prose and line == hideOption
+    if result.len == 0 or result[^1].prose != prose or hide:
+      result.add Chunk(prose: prose, hidden: hide)
+    result[^1].lines.add(
+      if prose:
+        line.substr(3)
+      else:
+        line
+    )
+  for c in result.mitems:
+    if not c.prose and not c.hidden:
+      let body = c.lines.trimBlank
+      c.hidden = body.len > 0 and body[0] == hideOption
+
+proc instrument(chunks: seq[Chunk]): string =
+  ## The vignette with a marker printed before each code chunk. The marker
+  ## replaces a line that prints nothing (a `#| hide` line, or the last line
+  ## of the prose before the chunk), so line numbers in compiler errors still
+  ## match the source (except before a first chunk with no prose above it).
+  var lines: seq[string]
+  for i, c in chunks:
+    if c.prose:
+      for line in c.lines:
+        lines.add "##" # keep the line, drop the text
+    else:
+      let marker = &"echo \"\\x1Echunk {i}\""
+      var body = c.lines
+      if body.len > 0 and body[0] == hideOption:
+        body[0] = marker
+      elif i > 0 and chunks[i - 1].prose:
+        lines[^1] = marker
+      else:
+        lines.add marker
+      lines.add body
+  lines.join("\n") & "\n"
+
+proc run(name, source, figureDir: string): string =
+  ## Compile and run the instrumented vignette; its standard output.
+  let plotterPath = getEnv("PLOTTER_PATH", "../nim-plotter/src")
+  let dir = createTempDir("drc-knit-", "")
+  defer:
+    removeDir(dir)
+  # The file must be a valid module name, so not the vignette's own.
+  let file = dir / "vignette.nim"
+  writeFile(file, source)
+  let compile = quoteShellCommand(
+    [
+      "nim",
+      "c",
+      "--hints:off",
+      "-d:release",
+      "--path:src",
+      "--path:vignettes",
+      "--path:" & plotterPath,
+      "--nimcache:" & dir / "cache",
+      "-o:" & dir / "vignette",
+      file,
+    ]
+  )
+  let (compileOut, compileCode) = execCmdEx(compile)
+  if compileCode != 0:
+    # Point errors at the vignette rather than the temporary copy.
+    quit(
+      &"{name}: compilation failed\n" &
+        compileOut.replace(file, "vignettes" / name & ".nim"),
+      1,
+    )
+  putEnv("DRC_FIGURE_DIR", figureDir)
+  let (output, code) = execCmdEx(dir / "vignette", options = {poUsePath})
+  if code != 0:
+    quit(&"{name}: exited with code {code}\n{output}", 1)
+  output
+
+proc render(name: string, chunks: seq[Chunk], output: string): string =
+  # What each code chunk printed, split at the markers.
+  var printed = newSeq[seq[string]](chunks.len)
+  var current = -1
+  for line in output.splitLines:
+    if line.startsWith(chunkMarker):
+      current = parseInt(line.substr(chunkMarker.len))
+    elif current >= 0:
+      printed[current].add line
+
+  var md = @[
+    &"<!-- Generated by vignettes/knit.nim from vignettes/{name}.nim: edit that, not this. -->",
+    "",
+  ]
+  for i, c in chunks:
+    if c.prose:
+      md.add c.lines.trimBlank
+      md.add ""
+      continue
+    if not c.hidden:
+      let code = c.lines.trimBlank
+      if code.len > 0:
+        md.add "```nim"
+        md.add code
+        md.add "```"
+        md.add ""
+    # Text output goes in a plain block, broken wherever a figure appears.
+    var text: seq[string]
+    proc flush() =
+      let body = text.trimBlank
+      if body.len > 0:
+        md.add "```"
+        md.add body
+        md.add "```"
+        md.add ""
+      text.setLen(0)
+
+    for line in printed[i]:
+      if line.startsWith(figureMarker):
+        flush()
+        let rest = line.substr(figureMarker.len)
+        let (file, alt) =
+          if ' ' in rest:
+            (rest.split(' ', 1)[0], rest.split(' ', 1)[1])
+          else:
+            (rest, "")
+        md.add &"![{alt}](figures/{name}/{file})"
+        md.add ""
+      else:
+        text.add line
+    flush()
+  md.trimBlank.join("\n") & "\n"
+
+proc titleAndSummary(chunks: seq[Chunk]): tuple[title, summary: string] =
+  ## The first `# ` heading, and the first paragraph after it.
+  let prose = chunks.filterIt(it.prose).mapIt(it.lines).concat
+  var i = 0
+  while i < prose.len and not prose[i].startsWith("# "):
+    inc i
+  if i < prose.len:
+    result.title = prose[i].substr(2)
+  inc i
+  while i < prose.len and prose[i].strip.len == 0:
+    inc i
+  var para: seq[string]
+  while i < prose.len and prose[i].strip.len > 0:
+    para.add prose[i].strip
+    inc i
+  result.summary = para.join(" ")
+
+when isMainModule:
+  if findExe("vl-convert").len == 0:
+    quit("`vl-convert` is not on PATH; it is needed to render the figures.", 1)
+  # Run from the repository root, wherever this was started from.
+  setCurrentDir(currentSourcePath().parentDir.parentDir)
+  let outDir = "docs" / "vignettes"
+  let wanted =
+    if paramCount() > 0:
+      commandLineParams()
+    else:
+      @vignettes
+  for name in wanted:
+    if name notin vignettes:
+      quit(&"unknown vignette `{name}`; expected one of {vignettes.join(\", \")}", 1)
+
+  var index = @[
+    "<!-- Generated by vignettes/knit.nim: edit the vignettes, not this. -->",
+    "",
+    "# Vignettes",
+    "",
+    "Worked examples of dose-response analysis with drc. Each is generated " &
+      "from a Nim program in [`vignettes/`](../../vignettes), so every output " &
+      "and figure comes from a real run. Re-render them with `nimble vignettes`.",
+    "",
+  ]
+  for name in vignettes:
+    let chunks = parse(readFile("vignettes" / name & ".nim"))
+    if name in wanted:
+      let figureDir = outDir / "figures" / name
+      removeDir(figureDir) # drop figures the vignette no longer makes
+      let output = run(name, instrument(chunks), absolutePath(figureDir))
+      writeFile(outDir / name & ".md", render(name, chunks, output))
+      echo &"  {outDir / name}.md"
+    let (title, summary) = titleAndSummary(chunks)
+    index.add &"- **[{title}]({name}.md)**: {summary}"
+  writeFile(outDir / "README.md", index.join("\n") & "\n")

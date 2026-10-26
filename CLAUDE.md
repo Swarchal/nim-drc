@@ -11,7 +11,11 @@ nimble test                                        # build and run every tests/t
 nim c -r --hints:off --path:src tests/tfit.nim     # one test file
 nim c -r --hints:off --path:src tests/tfit.nim "fitLL4: ryegrass reference::zero doses dropped"   # one test ("suite::test", globs allowed)
 nim c -r -d:release --path:src <file>.nim          # benchmarks / timing
+nimble figures                                     # re-render docs/images (README figures)
+nimble vignettes                                   # re-render docs/vignettes; `nim c -r vignettes/knit.nim intervals` for one
 ```
+
+`figures` and `vignettes` need nim-plotter (`$PLOTTER_PATH`, default `../nim-plotter/src`) and `vl-convert` on PATH. plotter is not a drc dependency: only `examples/` and `vignettes/` import it.
 
 `nimble test` stops at the first failing file, so a failure can hide later files. Compiled test binaries land next to their sources in `tests/`.
 
@@ -51,6 +55,14 @@ Design decisions that span files:
   - LM sees the observation index as x, and a closure maps the joint vector to that observation's curve's 5-vector, calls `ll5` and scatters the gradient.
   - Starts come from per-curve `fitCurve` fits (falling back to `drcGuess` for curves too small to fit alone), with shared parameters at the median over curves, plus a start from the pooled fit. The multi-start grid and the symmetric-then-asymmetric 5PL stage mirror `searchLM`. There is no Nelder–Mead fallback, and robust losses raise `ValueError`.
   - `fit.curves[c]` is a `DrcFit` view: curve c's 5×5 covariance block, the joint df and pooled σ, its own n/ssr/R²/dose range. `logLik`/`aic`/`bic` are NaN on views, so single-curve inference works on them unchanged.
+
+## Vignettes
+
+- `vignettes/<name>.nim` are literate programs: column-0 `## ` lines are Markdown prose, everything else is code. `vignettes/knit.nim` runs each one and writes `docs/vignettes/<name>.md` with every chunk's code and real output, plus `docs/vignettes/README.md` (an index built from each title and first paragraph). Never edit the generated `.md` files. The order is the `vignettes` list in `knit.nim`.
+- Code from a column-0 `#| hide` line to the next prose or `#| hide` line runs but isn't shown. Prose and `#| hide` lines must not split a statement.
+- `vignettes/drcplot.nim` holds the plotting helpers, shared with `examples/figures.nim`. `figure(chart, name, alt)` writes `docs/vignettes/figures/<vignette>/<name>.png` and prints a marker that knit turns into an image link.
+- plotter drops the data of a nested `layer` whose children all share one data frame, and of a `layer` inside a `facet` (its hoisting bug in `vegalite.nim`). Give each chart inside a nested layer its own frame; for a faceted layer, put the frame on the layer with `withData` (see `screening.nim`).
+- Output must be deterministic (fixed seeds, no timings), so re-rendering only changes what actually changed.
 
 ## Testing conventions
 
