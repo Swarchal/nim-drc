@@ -59,12 +59,15 @@ same `weights`, `fixed`, `bounds` and `opts` arguments.
 import drc
 
 # Ryegrass root length vs ferulic acid concentration (mM), from the R drc package
-let doses = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.94, 0.94, 0.94, 1.88, 1.88, 1.88,
-             3.75, 3.75, 3.75, 7.5, 7.5, 7.5, 15.0, 15.0, 15.0, 30.0, 30.0, 30.0]
-let rootLength = [7.58, 8.0, 8.3285714, 7.25, 7.375, 7.9625,
-                  8.3555556, 6.9142857, 7.75, 6.8714286, 6.45, 5.9222222,
-                  1.925, 2.8857143, 4.2333333, 1.1875, 0.8571429, 1.0571429,
-                  0.6875, 0.525, 0.825, 0.25, 0.22, 0.44]
+let doses = [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.94, 0.94, 0.94, 1.88, 1.88, 1.88, 3.75, 3.75, 3.75,
+  7.5, 7.5, 7.5, 15.0, 15.0, 15.0, 30.0, 30.0, 30.0,
+]
+let rootLength = [
+  7.58, 8.0, 8.3285714, 7.25, 7.375, 7.9625, 8.3555556, 6.9142857, 7.75, 6.8714286,
+  6.45, 5.9222222, 1.925, 2.8857143, 4.2333333, 1.1875, 0.8571429, 1.0571429, 0.6875,
+  0.525, 0.825, 0.25, 0.22, 0.44,
+]
 
 let fit = fitLL4(doses, rootLength)
 echo fit.summary
@@ -98,7 +101,7 @@ For responses normalised to controls, fix the plateaus at 0 and 100:
 import std/strformat
 import drc
 
-let doses = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4]   # molar
+let doses = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4] # molar
 let viability = [98.2, 95.1, 71.4, 22.9, 6.3, 2.0] # % of untreated control
 
 let fit = fitLL4(doses, viability, fixed = [(Bottom, 0.0), (Top, 100.0)])
@@ -126,11 +129,13 @@ what is physically possible:
 import std/strformat
 import drc
 
-let doses = [1e-9, 1e-9, 1e-8, 1e-8, 1e-7, 1e-7, 1e-6, 1e-6, 1e-5, 1e-5]   # molar
-let viability = [101.3, 97.8, 96.1, 99.0, 78.2, 74.9, 31.5, 36.0, 4.1, 1.2] # % of control
+let doses = [1e-9, 1e-9, 1e-8, 1e-8, 1e-7, 1e-7, 1e-6, 1e-6, 1e-5, 1e-5] # molar
+# % of control
+let viability = [101.3, 97.8, 96.1, 99.0, 78.2, 74.9, 31.5, 36.0, 4.1, 1.2]
 
 let free = fitLL4(doses, viability)
-let fit = fitLL4(doses, viability, bounds = [(Bottom, 0.0 .. Inf), (Top, -Inf .. 100.0)])
+let fit =
+  fitLL4(doses, viability, bounds = [(Bottom, 0.0 .. Inf), (Top, -Inf .. 100.0)])
 echo &"unbounded: Bottom {free.params[Bottom]:.2f}, Top {free.params[Top]:.2f}, IC50 {free.ec50 * 1e9:.1f} nM"
 echo &"bounded:   Bottom {fit.params[Bottom]:.2f}, Top {fit.params[Top]:.2f}, IC50 {fit.ec50 * 1e9:.1f} nM"
 echo "at a bound: ", fit.atBound
@@ -178,13 +183,15 @@ Warning: a parameter is at a bound; its standard error and interval ignore the b
 import std/[math, strformat]
 import drc
 
-var doses = @[0.0, 0.0]                 # two untreated controls
-for k in 0 .. 12:                       # 1 nM to 1 mM in half-log steps, duplicates
+var doses = @[0.0, 0.0] # two untreated controls
+for k in 0 .. 12: # 1 nM to 1 mM in half-log steps, duplicates
   let dose = pow(10.0, -9.0 + 0.5 * float(k))
   doses.add [dose, dose]
-let responses = [5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38, 37.01, 36.75,
-                 54.87, 52.8, 75.55, 77.0, 86.17, 87.94, 89.67, 90.89, 90.97, 94.18, 92.39,
-                 95.46, 95.3, 94.61, 89.96, 93.92]
+let responses = [
+  5.0, 5.6, 8.34, 7.1, 10.65, 9.57, 16.18, 18.74, 22.64, 22.38, 37.01, 36.75, 54.87,
+  52.8, 75.55, 77.0, 86.17, 87.94, 89.67, 90.89, 90.97, 94.18, 92.39, 95.46, 95.3,
+  94.61, 89.96, 93.92,
+]
 
 let four = fitLL4(doses, responses)
 let five = fitLL5(doses, responses)
@@ -221,8 +228,10 @@ data across both plateaus; prefer the 4PL unless the asymmetry is clear.
 import std/strformat
 import drc
 
-let doses = [0.0, 0.0, 0.94, 0.94, 1.88, 1.88, 3.75, 3.75, 7.5, 7.5, 15.0, 15.0, 30.0, 30.0]
-let resp = [7.58, 8.0, 8.36, 6.91, 6.87, 6.45, 1.93, 2.89, 1.19, 0.86, 0.69, 0.53, 0.25, 0.22]
+let doses =
+  [0.0, 0.0, 0.94, 0.94, 1.88, 1.88, 3.75, 3.75, 7.5, 7.5, 15.0, 15.0, 30.0, 30.0]
+let resp =
+  [7.58, 8.0, 8.36, 6.91, 6.87, 6.45, 1.93, 2.89, 1.19, 0.86, 0.69, 0.53, 0.25, 0.22]
 let fit = fitLL4(doses, resp)
 
 for pct in [10.0, 50.0, 90.0]:
@@ -286,8 +295,11 @@ variance σ²/wᵢ, and σ is estimated from the fit. A weight of 0 excludes an
 observation.
 
 ```nim
-let fit = fitLL4(doses, resp, weights = [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 1.0,
-                                         1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+let fit = fitLL4(
+  doses,
+  resp,
+  weights = [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+)
 ```
 
 ### Robust fitting (outliers)
@@ -301,14 +313,16 @@ import std/strformat
 import drc
 
 # % activity of an inhibitor, triplicates, with three wells gone wrong
-let doses = [1e-9, 1e-9, 1e-9, 3.16e-9, 3.16e-9, 3.16e-9, 1e-8, 1e-8, 1e-8,
-             3.16e-8, 3.16e-8, 3.16e-8, 1e-7, 1e-7, 1e-7, 3.16e-7, 3.16e-7, 3.16e-7,
-             1e-6, 1e-6, 1e-6, 3.16e-6, 3.16e-6, 3.16e-6, 1e-5, 1e-5, 1e-5,
-             3.16e-5, 3.16e-5, 3.16e-5, 1e-4, 1e-4, 1e-4]
-let activity = [104.03, 90.24, 99.16, 95.92, 136.26, 96.97, 90.44, 95.81, 93.91,
-                102.27, 92.98, 91.24, 77.88, 76.72, 75.56, 48.83, 16.45, 49.28,
-                24.15, 20.67, 21.35, 12.34, 9.33, 6.18, 2.95, 35.12, 9.3,
-                1.57, 1.65, 5.39, -0.56, 1.22, 4.74]
+let doses = [
+  1e-9, 1e-9, 1e-9, 3.16e-9, 3.16e-9, 3.16e-9, 1e-8, 1e-8, 1e-8, 3.16e-8, 3.16e-8,
+  3.16e-8, 1e-7, 1e-7, 1e-7, 3.16e-7, 3.16e-7, 3.16e-7, 1e-6, 1e-6, 1e-6, 3.16e-6,
+  3.16e-6, 3.16e-6, 1e-5, 1e-5, 1e-5, 3.16e-5, 3.16e-5, 3.16e-5, 1e-4, 1e-4, 1e-4,
+]
+let activity = [
+  104.03, 90.24, 99.16, 95.92, 136.26, 96.97, 90.44, 95.81, 93.91, 102.27, 92.98, 91.24,
+  77.88, 76.72, 75.56, 48.83, 16.45, 49.28, 24.15, 20.67, 21.35, 12.34, 9.33, 6.18,
+  2.95, 35.12, 9.3, 1.57, 1.65, 5.39, -0.56, 1.22, 4.74,
+]
 
 for loss in [Squared, Huber, Tukey]:
   let fit = fitLL4(doses, activity, opts = FitOptions(loss: loss))
@@ -317,7 +331,8 @@ for loss in [Squared, Huber, Tukey]:
 
 let tukey = fitLL4(doses, activity, opts = FitOptions(loss: Tukey))
 for i, w in tukey.robustWeights:
-  if w < 0.5: echo &"well {i}: dose {doses[i]:g}, activity {activity[i]}, weight {w:.2f}"
+  if w < 0.5:
+    echo &"well {i}: dose {doses[i]:g}, activity {activity[i]}, weight {w:.2f}"
 ```
 
 ```
@@ -371,15 +386,16 @@ import drc
 # Simulated potency assay: a reference standard and two test samples, each at
 # nine half-log concentrations (0.01 to 100 ng/ml) in duplicate. The samples
 # were simulated as 4× and 1/5× as potent as the reference.
-let response = [0.037, 0.07, 0.059, 0.157, 0.207, 0.161, 0.498, 0.508, 1.048,
-                1.013, 1.632, 1.587, 1.832, 1.768, 2.002, 1.956, 1.987, 2.026,
-                0.138, 0.129, 0.269, 0.263, 0.574, 0.492, 1.175, 1.148, 1.645,
-                1.593, 1.868, 1.904, 2.021, 1.963, 2.006, 1.988, 1.942, 1.981,
-                0.036, 0.05, 0.101, 0.088, 0.069, 0.066, 0.167, 0.162, 0.306,
-                0.305, 0.799, 0.815, 1.375, 1.415, 1.789, 1.749, 1.944, 1.885]
+let response = [
+  0.037, 0.07, 0.059, 0.157, 0.207, 0.161, 0.498, 0.508, 1.048, 1.013, 1.632, 1.587,
+  1.832, 1.768, 2.002, 1.956, 1.987, 2.026, 0.138, 0.129, 0.269, 0.263, 0.574, 0.492,
+  1.175, 1.148, 1.645, 1.593, 1.868, 1.904, 2.021, 1.963, 2.006, 1.988, 1.942, 1.981,
+  0.036, 0.05, 0.101, 0.088, 0.069, 0.066, 0.167, 0.162, 0.306, 0.305, 0.799, 0.815,
+  1.375, 1.415, 1.789, 1.749, 1.944, 1.885,
+]
 var doses: seq[float]
-var curve: seq[int]  # which curve each observation belongs to
-for c in 0 .. 2:     # 0: reference, 1: sample A, 2: sample B
+var curve: seq[int] # which curve each observation belongs to
+for c in 0 .. 2: # 0: reference, 1: sample A, 2: sample B
   for k in 0 .. 8:
     let dose = pow(10.0, -2.0 + 0.5 * float(k))
     doses.add [dose, dose]
@@ -453,9 +469,11 @@ contain the simulated values (4 and 0.2).
 Problems are reported in `fit.warnings` rather than raised:
 
 ```nim
-let fit = fitLL4([0.01, 0.1, 1.0, 10.0], [99.0, 97.0, 90.0, 82.0], fixed = [(Bottom, 0.0)])
+let fit =
+  fitLL4([0.01, 0.1, 1.0, 10.0], [99.0, 97.0, 90.0, 82.0], fixed = [(Bottom, 0.0)])
 if not fit.converged or fit.warnings != {}:
-  for w in fit.warnings: echo "warning: ", w
+  for w in fit.warnings:
+    echo "warning: ", w
 ```
 
 ```
@@ -508,9 +526,9 @@ and writes its gradient with respect to the parameters:
 import std/[math, strformat]
 import drc
 
-proc expDecay(x: float; p: array[2, float]; grad: var array[2, float]): float =
+proc expDecay(x: float, p: array[2, float], grad: var array[2, float]): float =
   let e = exp(-p[1] * x)
-  grad = [e, -p[0] * x * e]    # ∂f/∂A, ∂f/∂k
+  grad = [e, -p[0] * x * e] # ∂f/∂A, ∂f/∂k
   p[0] * e
 
 let x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
