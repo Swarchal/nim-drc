@@ -6,7 +6,7 @@ Dose-response curve fitting for Nim, with no dependencies beyond the standard li
 - Levenberg–Marquardt with multi-start, and a Nelder–Mead fallback
 - Zero-dose controls, fixed or bounded parameters and weighted fits
 - Robust fits (Huber, Tukey bisquare) that downweight or reject outliers
-- Standard errors, t-based confidence intervals, R², AIC/BIC
+- Standard errors, t-based (Wald or profile-likelihood) confidence intervals, R², AIC/BIC, residuals and a lack-of-fit test
 - EC50 and any ECx (EC10, EC90, …), relative or absolute, with confidence intervals
 - Inverse prediction: doses read off a standard curve, with calibration intervals
 - Confidence and prediction bands for the fitted curve
@@ -257,6 +257,60 @@ AIC free Hill: 23.53, Hill = -1: 47.86
 `ecx(fit, p)` is the dose giving p% of the change from the low-dose plateau to
 the high-dose plateau. ECx intervals are computed on the log-dose scale and
 back-transformed, so they are asymmetric in dose.
+
+### Profile-likelihood intervals
+
+`confint` and `ecxCI` are Wald (delta-method) intervals: they treat the SSR
+as quadratic around the estimate, so they are symmetric (on the log-dose
+scale, for ECx). On sparse or partial curves that can be badly wrong.
+`profileCI(fit, param)` and `ecxProfileCI(fit, pct)` (or `ec50ProfileCI`)
+instead hold the parameter at each candidate value, refit the others, and
+keep the values the data do not reject, as R's `confint` on an `nls` fit:
+
+```nim
+import std/strformat
+import drc
+
+# The response has only fallen to about two thirds by the top dose
+let doses = [1e-9, 1e-9, 1e-8, 1e-8, 1e-7, 1e-7, 1e-6, 1e-6, 1e-5, 1e-5] # molar
+let response = [100.4, 99.1, 98.7, 97.2, 93.0, 91.2, 80.1, 82.4, 68.0, 66.3]
+let fit = fitLL4(doses, response)
+
+echo "            estimate      Wald 95%             profile 95%"
+for param in [Bottom, Top, Hill]:
+  let (w, p) = (fit.confint(param), fit.profileCI(param))
+  echo &"{$param:<10}{fit.params[param]:>9.2f}   [{w.lower:7.2f}, {w.upper:7.2f}]   [{p.lower:7.2f}, {p.upper:7.2f}]"
+let (w, p) = (fit.ec50CI, fit.ec50ProfileCI)
+echo &"EC50 (µM) {fit.ec50 * 1e6:>9.2f}   [{w.lower * 1e6:7.2f}, {w.upper * 1e6:7.2f}]   [{p.lower * 1e6:7.2f}, {p.upper * 1e6:7.2f}]"
+```
+
+```
+            estimate      Wald 95%             profile 95%
+Bottom        49.24   [  18.48,   80.01]   [   -inf,   63.31]
+Top          100.96   [  97.51,  104.42]   [  98.40,  108.84]
+Hill          -0.48   [  -0.78,   -0.19]   [  -0.78,   -0.18]
+EC50 (µM)      2.70   [   0.22,   33.78]   [   0.76,     inf]
+```
+
+The data never reach the lower plateau, so nothing rules out a Bottom far
+below them, and with it an EC50 far beyond the tested doses. The Wald
+intervals hide that. The profile intervals show it as an infinite end.
+
+- **The interval** is the set of values β with τ(β) ≤ t, where
+  τ(β) = sqrt((S(β) − Ŝ)/σ²), S(β) is the SSR refitted with the parameter
+  held at β, and t is the t quantile on `fit.df` degrees of freedom.
+- **An infinite end** means τ does not reach t within 10·t standard errors
+  of the estimate (R reports `NA` there). Far out, a plateau typically runs
+  off to infinity, and the refits stop being reliable.
+- **Bounds:** if the data do not exclude a bound, the bound is the end. In
+  the bounded example above, Bottom's interval starts at 0 and Top's ends
+  at 100. Asymmetry's interval stops at 0.
+- **For ECx**, the model is rewritten with log10(ECx) in place of LogEC50,
+  which is then profiled. It works for 5PL fits too, and is not available
+  when LogEC50 is fixed or bounded.
+- **Cost:** each interval refits the curve many times, so it takes about as
+  long as one fit (0.25 ms for the ryegrass 4PL). Least-squares fits only,
+  and not for the curves of a joint fit. `opts.lm` controls the refits.
 
 ### Confidence and prediction bands
 
@@ -568,6 +622,45 @@ non-finite responses, mismatched lengths, too few observations, a non-positive
 Asymmetry, bounds that are empty or on a fixed parameter, and confidence
 levels or percentages out of range.
 
+### Residuals and lack of fit
+
+A fit keeps its data (`fit.doses`, `fit.responses`, `fit.weights`), so it can
+give its residuals and test whether the curve describes the data at all.
+With the doses and responses of the 5PL example above:
+
+```nim
+for fit in [fitLL4(doses, responses), fitLL5(doses, responses)]:
+  let t = fit.lackOfFit
+  echo &"{fit.model} lack of fit: F = {t.f:.2f} on {t.df1} and {t.df2} df, p = {t.p:.4f}"
+
+let four = fitLL4(doses, responses)
+for i, r in four.pearsonResiduals:
+  if abs(r) > 2.0:
+    echo &"4PL: dose {four.doses[i]:g}, response {four.responses[i]}, fitted {four.fitted[i]:.2f}, Pearson residual {r:.2f}"
+```
+
+```
+4PL lack of fit: F = 3.99 on 10 and 14 df, p = 0.0095
+5PL lack of fit: F = 1.80 on 9 and 14 df, p = 0.1559
+4PL: dose 1e-08, response 18.74, fitted 13.93, Pearson residual 2.26
+4PL: dose 0.001, response 89.96, fitted 94.31, Pearson residual -2.04
+```
+
+- **`lackOfFit(fit)`** compares the curve with a model that has a free mean
+  at each dose, using the scatter among replicates as pure error, as drc's
+  `modelFit` and R's `anova(fit, lm(y ~ factor(dose)))`. A small p means the
+  curve misses the dose means by more than replicate scatter explains. Here
+  the symmetric 4PL fails and the 5PL does not. The test needs replicates at
+  some dose and more doses than free parameters, and a least-squares fit.
+  For a joint fit, call it on the `MultiFit`, where each curve's doses are
+  separate groups.
+- **`residuals(fit)`** are yᵢ − f(xᵢ), and **`fitted(fit)`** the fitted
+  values, for every observation including zero-weight ones.
+- **`pearsonResiduals(fit)`** are √wᵢ·(yᵢ − f(xᵢ))/σ, as R's
+  `residuals(type = "pearson")`. They have roughly unit variance, so look
+  for values beyond ±2–3 and for runs of the same sign. They are 0 for
+  zero-weight observations. For a robust fit, σ is the robust scale.
+
 ### How fits are found
 
 1. **Starting values** come from the data: the plateaus from the extreme mean
@@ -629,8 +722,8 @@ For the parameter covariance, build JᵀWJ at the solution with
 
 | File | Contents |
 |---|---|
-| `src/drc.nim` | public API: `fitCurve` (and `fitLL3`/`fitLL4`/`fitLL5`), `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `doseAt`, `doseAtCI`, `calibrationCI`, `predict`, `confidenceBand`, `predictionBand` |
-| `src/drc/multi.nim` | joint fits of several curves: `fitMulti` (and `fitLL4Multi` etc.), `MultiFit`, `param`, `cov`, `relativePotency`, `fTest` (included by `drc.nim`) |
+| `src/drc.nim` | public API: `fitCurve` (and `fitLL3`/`fitLL4`/`fitLL5`), `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `doseAt`, `doseAtCI`, `calibrationCI`, `predict`, `fitted`, `residuals`, `pearsonResiduals`, `lackOfFit`, `profileCI`, `ecxProfileCI`, `ec50ProfileCI`, `confidenceBand`, `predictionBand` |
+| `src/drc/multi.nim` | joint fits of several curves: `fitMulti` (and `fitLL4Multi` etc.), `MultiFit`, `param`, `cov`, `relativePotency`, `fTest`, `lackOfFit` (included by `drc.nim`) |
 | `src/drc/models.nim` | the 5PL model with its analytic gradient, and initial guesses |
 | `src/drc/lm.nim` | Levenberg–Marquardt for weighted least squares |
 | `src/drc/neldermead.nim` | Nelder–Mead simplex minimisation |
@@ -661,6 +754,13 @@ The tests compare against reference values from R:
   coefficients, standard errors, the full covariance matrix, SSR and AIC.
   F tests match `anova`; relative potency intervals match a delta-method
   calculation in R with ECx found by root finding.
+- **Profile-likelihood intervals:** the exact ends, found in R by root
+  finding on the profile t statistic with `nls` refits (`port` within
+  bounds), for 3PL, 4PL (weighted and unweighted), 5PL, bounded fits and a
+  partial curve, including ECx intervals. They agree with R's own
+  spline-based `confint` to about 1e-4. R's refits stop short where a
+  plateau runs off to infinity, so those ends are instead checked against a
+  multi-start fit with the parameter fixed there.
 - **Distributions:** `qt`, `pt`, `pbeta` and `pf`.
 - **Cross-checks:** the parameter estimates also agree with SciPy's `curve_fit`
   and with the LL.4 and ED10/50/90 estimates published for `drc`.

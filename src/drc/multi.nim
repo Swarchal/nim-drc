@@ -9,37 +9,34 @@
 
 import std/[algorithm, hashes, strutils]
 
-type
-  MultiFit* = object
-    model*: Model
-    shared*: set[DrcParam] ## one value for all curves; includes the fixed parameters
-    fixed*: set[DrcParam] ## includes Asymmetry (= 1) for 3PL and 4PL fits
-    lower*, upper*: array[DrcParam, float]
-      ## the bounds on each parameter, for every curve: −Inf and Inf when unbounded
-    atBound*: set[DrcParam] ## free parameters that ended on a bound in any curve
-    curves*: seq[DrcFit] ## each curve as a single fit (see `fitMulti`)
-    n*: int ## observations with non-zero weight
-    df*: int ## n − number of free joint parameters
-    ssr*: float
-    sigma*: float ## pooled residual standard error, sqrt(ssr / df)
-    rSquared*: float
-    logLik*: float ## Gaussian log-likelihood, as R's logLik.nls
-    aic*: float
-    bic*: float
-    converged*: bool
-    iterations*: int ## iterations of the Levenberg–Marquardt run that won
-    status*: LMStatus
-    warnings*: set[FitWarning] ## includes fwEc50OutsideRange if any curve has it
-    slots: seq[array[DrcParam, int]]
-      ## slots[c][param]: where curve c's parameter is in `joint`
-    joint: seq[float] ## the joint parameter vector
-    jointFree: seq[bool] ## false for the slots of fixed parameters
-    jointCov: seq[seq[float]] ## joint covariance σ²(JᵀWJ)⁻¹; 0 for fixed slots
-    fixedValues: ParamVec
-    curveIds: seq[int]
-    dataHash: Hash
-
-  FTest* = tuple[f: float, df1, df2: int, p: float]
+type MultiFit* = object
+  model*: Model
+  shared*: set[DrcParam] ## one value for all curves; includes the fixed parameters
+  fixed*: set[DrcParam] ## includes Asymmetry (= 1) for 3PL and 4PL fits
+  lower*, upper*: array[DrcParam, float]
+    ## the bounds on each parameter, for every curve: −Inf and Inf when unbounded
+  atBound*: set[DrcParam] ## free parameters that ended on a bound in any curve
+  curves*: seq[DrcFit] ## each curve as a single fit (see `fitMulti`)
+  n*: int ## observations with non-zero weight
+  df*: int ## n − number of free joint parameters
+  ssr*: float
+  sigma*: float ## pooled residual standard error, sqrt(ssr / df)
+  rSquared*: float
+  logLik*: float ## Gaussian log-likelihood, as R's logLik.nls
+  aic*: float
+  bic*: float
+  converged*: bool
+  iterations*: int ## iterations of the Levenberg–Marquardt run that won
+  status*: LMStatus
+  warnings*: set[FitWarning] ## includes fwEc50OutsideRange if any curve has it
+  slots: seq[array[DrcParam, int]]
+    ## slots[c][param]: where curve c's parameter is in `joint`
+  joint: seq[float] ## the joint parameter vector
+  jointFree: seq[bool] ## false for the slots of fixed parameters
+  jointCov: seq[seq[float]] ## joint covariance σ²(JᵀWJ)⁻¹; 0 for fixed slots
+  fixedValues: ParamVec
+  curveIds: seq[int]
+  dataHash: Hash
 
 proc median(values: openArray[float]): float =
   var s = @values
@@ -355,6 +352,12 @@ proc fitMulti*(
     for param in DrcParam:
       v.se[param] = sqrt(v.cov[param][param])
     v.n = nCurve[c]
+    v.jointView = true
+    for i in 0 ..< doses.len:
+      if curve[i] == c:
+        v.doses.add doses[i]
+        v.responses.add responses[i]
+        v.weights.add w[i]
     v.df = result.df
     v.sigma = result.sigma
     var
@@ -505,6 +508,17 @@ proc fTest*(reduced, full: MultiFit): FTest =
     df1 = reduced.df - full.df
     f = ((reduced.ssr - full.ssr) / float(df1)) / (full.ssr / float(full.df))
   (f, df1, full.df, fTail(f, float(df1), float(full.df)))
+
+proc lackOfFit*(fit: MultiFit): FTest =
+  ## Lack-of-fit F test of the joint fit against one free mean per dose of
+  ## each curve, as `lackOfFit` for a single fit. A small p for parallel
+  ## curves that `fTest` does not reject still means some curve is misfitted.
+  var pe: tuple[ss: float, groups: int]
+  for curve in fit.curves:
+    let p = pureError(curve.doses, curve.responses, curve.weights)
+    pe.ss += p.ss
+    pe.groups += p.groups
+  lackOfFitTest(fit.ssr, fit.df, fit.n, pe)
 
 proc summary*(fit: MultiFit, level = 0.95): string =
   ## A printable table of the joint estimates and each curve's EC50.

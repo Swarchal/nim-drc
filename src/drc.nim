@@ -6,7 +6,7 @@
 ##   echo fit.ec50, " ", fit.ec50CI
 ##   echo fit.summary
 
-import std/[math, strformat]
+import std/[algorithm, math, strformat]
 from std/stats import
   RunningStat, push, mean, varianceS # drc/stats is a different module
 import drc/[linalg, lm, models, neldermead, robust, stats]
@@ -48,6 +48,8 @@ type
 
   Band* = tuple[fit, lower, upper: float] ## a fitted response and its interval
 
+  FTest* = tuple[f: float, df1, df2: int, p: float]
+
   DrcFit* = object
     model*: Model
     params*: array[DrcParam, float]
@@ -86,6 +88,9 @@ type
       ## how the final Levenberg–Marquardt run stopped; with the
       ## fallback, `converged` may be true when this is not
     warnings*: set[FitWarning]
+    doses*, responses*: seq[float] ## the data, as given
+    weights*: seq[float] ## the weights, as given (all 1 if none were)
+    jointView: bool ## a curve of a joint fit (`MultiFit.curves`)
 
   ParamVec = array[drcParamCount, float]
 
@@ -310,6 +315,337 @@ proc predictionBand*(
 
 proc predictionBand*(fit: DrcFit, dose: float, level = 0.95, weight = 1.0): Band =
   fit.bandAt(dose, fit.tQuantile(level), fit.residualVariance(weight))
+
+proc fitted*(fit: DrcFit): seq[float] =
+  ## The fitted mean response at each observation's dose.
+  fit.predict(fit.doses)
+
+proc residuals*(fit: DrcFit): seq[float] =
+  ## Response residuals yᵢ − f(xᵢ), as R's `residuals(type = "response")`.
+  ## Zero-weight observations are included.
+  result = fit.fitted
+  for i in 0 ..< result.len:
+    result[i] = fit.responses[i] - result[i]
+
+proc pearsonResiduals*(fit: DrcFit): seq[float] =
+  ## √wᵢ·(yᵢ − f(xᵢ))/σ, as R's `residuals(type = "pearson")`: roughly unit
+  ## variance under the fitted weights, so values beyond ±2–3 stand out. For
+  ## a robust fit, σ is the robust scale. 0 for zero-weight observations.
+  result = fit.residuals
+  for i in 0 ..< result.len:
+    result[i] = sqrt(fit.weights[i]) * result[i] / fit.sigma
+
+proc pureError(
+    doses, responses, weights: openArray[float]
+): tuple[ss: float, groups: int] =
+  ## The weighted sum of squares about each dose's weighted mean response,
+  ## and the number of doses, over observations with non-zero weight.
+  var points: seq[(float, int)] # (dose, observation), sorted by dose
+  for i in 0 ..< doses.len:
+    if weights[i] > 0.0:
+      points.add (doses[i], i)
+  points.sort()
+  var k = 0
+  while k < points.len:
+    var j = k
+    var sumW, sumWY = 0.0
+    while j < points.len and points[j][0] == points[k][0]:
+      let i = points[j][1]
+      sumW += weights[i]
+      sumWY += weights[i] * responses[i]
+      inc j
+    for (_, i) in points[k ..< j]:
+      result.ss += weights[i] * (responses[i] - sumWY / sumW) ^ 2
+    inc result.groups
+    k = j
+
+proc lackOfFitTest(ssr: float, df, n: int, pe: tuple[ss: float, groups: int]): FTest =
+  ## F test of the curve against one mean per dose: lack of fit
+  ## (SSR − SSpe on groups − p df) against pure error (SSpe on n − groups df).
+  let
+    df1 = pe.groups - (n - df)
+    df2 = n - pe.groups
+  if df2 < 1:
+    raise newException(
+      ValueError, "a lack-of-fit test needs replicate observations at some dose"
+    )
+  if df1 < 1:
+    raise newException(
+      ValueError,
+      "a lack-of-fit test needs more doses than fitted parameters, got " & $pe.groups &
+        " doses for " & $(n - df) & " parameters",
+    )
+  let f = ((ssr - pe.ss) / float(df1)) / (pe.ss / float(df2))
+  (f, df1, df2, fTail(f, float(df1), float(df2)))
+
+proc lackOfFit*(fit: DrcFit): FTest =
+  ## Lack-of-fit F test: does the curve describe the mean responses at each
+  ## dose? It compares the fit with one free mean per dose, using the
+  ## scatter among replicates as pure error, as R's
+  ## `anova(fit, lm(y ~ factor(dose)))` and drc's `modelFit`. A small p means
+  ## the curve misses the dose means by more than replicate scatter explains.
+  ## Needs replicates at some dose and more doses than free parameters. Not
+  ## available for robust fits or for the curves of a joint fit (use
+  ## `lackOfFit` on the `MultiFit`).
+  if fit.loss != Squared:
+    raise newException(ValueError, "a lack-of-fit test needs a least-squares fit")
+  if fit.jointView:
+    raise
+      newException(ValueError, "for a curve of a joint fit, test the joint fit instead")
+  lackOfFitTest(
+    fit.ssr, fit.df, fit.n, pureError(fit.doses, fit.responses, fit.weights)
+  )
+
+proc profileTau[F](
+    fn: F,
+    x, y, w: openArray[float],
+    j: int,
+    beta: float,
+    start: ParamVec,
+    pinned: array[drcParamCount, bool],
+    box: Box,
+    ssrHat, sigma: float,
+    lm: LMOptions,
+    params: var ParamVec,
+): float =
+  ## The profile t statistic τ(β) = sqrt(S(β) − Ŝ)/σ, where S(β) is the SSR
+  ## refitted from `start` with parameter j held at β; `params` gets the refit.
+  ## Inf if the refit has no finite SSR.
+  var p = start
+  p[j] = beta
+  let r = levenbergMarquardt(fn, x, y, w, p, pinned, box.lower, box.upper, lm)
+  params = r.params
+  if r.ssr.isNaN:
+    Inf
+  else:
+    sqrt(max(r.ssr - ssrHat, 0.0)) / sigma
+
+proc profileEnd[F](
+    fn: F,
+    x, y, w: openArray[float],
+    pHat: ParamVec,
+    j: int,
+    free: array[drcParamCount, bool],
+    box: Box,
+    ssrHat, sigma, tq, step, direction: float,
+    lm: LMOptions,
+): float =
+  ## One end of a profile-likelihood interval: the value β of parameter j,
+  ## beyond pHat[j] in `direction` (±1), at which τ(β) reaches `tq`. It steps
+  ## outwards from pHat[j] (by `step`, growing 1.5× each time) until τ passes
+  ## `tq`, then finds the crossing by the Illinois method. Each refit starts
+  ## from the nearest point inside the crossing, so the profile follows one
+  ## valley. If τ stays below `tq` up to a bound, the bound is the end (0 for
+  ## Asymmetry, which must be positive). As R's `profile.nls`, the profile is
+  ## followed only to 10·`tq` steps from the estimate, and if τ has not
+  ## reached `tq` by then the end is ±Inf (a finite bound beyond that is
+  ## still tried): far out, the refits are poorly conditioned (on a partial
+  ## curve, a plateau runs off to infinity) and can stop short of the
+  ## minimum, which would look like a crossing.
+  var pinned = free
+  pinned[j] = false
+  let open = j == ord(Asymmetry) and direction < 0.0 and not (box.lower[j] > 0.0)
+  let limit =
+    if direction > 0.0:
+      box.upper[j]
+    elif open:
+      0.0
+    else:
+      box.lower[j]
+  let reach = 10.0 * tq * step
+  var
+    inner = pHat[j]
+    innerP = pHat
+    innerTau = 0.0
+    outer, outerTau: float
+    found = false
+    h = step
+    p: ParamVec
+  for _ in 0 ..< 60:
+    var beta = inner + direction * h
+    var atLimit = false
+    if (beta - limit) * direction >= 0.0:
+      if open:
+        beta = 0.5 * (inner + limit) # approach 0 without reaching it
+      else:
+        (beta, atLimit) = (limit, true)
+    if not atLimit and abs(beta - pHat[j]) > reach:
+      if not limit.isFinite:
+        return direction * Inf
+      (beta, atLimit) = (limit, true)
+    let t = profileTau(fn, x, y, w, j, beta, innerP, pinned, box, ssrHat, sigma, lm, p)
+    if t >= tq:
+      (outer, outerTau, found) = (beta, t, true)
+      break
+    if atLimit:
+      return limit
+    (inner, innerP, innerTau) = (beta, p, t)
+    h *= 1.5
+  if not found:
+    return limit # only reachable when approaching Asymmetry's 0
+
+  var
+    (a, ga) = (inner, innerTau - tq) # ga < 0
+    (b, gb) = (outer, outerTau - tq) # gb ≥ 0
+    side = 0
+  for _ in 0 ..< 200:
+    if abs(b - a) <= 1e-12 * step:
+      break
+    var c = (a * gb - b * ga) / (gb - ga)
+    if not (c > min(a, b) and c < max(a, b)):
+      c = 0.5 * (a + b) # e.g. gb = Inf
+    let gc =
+      profileTau(fn, x, y, w, j, c, innerP, pinned, box, ssrHat, sigma, lm, p) - tq
+    if gc == 0.0:
+      return c
+    if gc < 0.0:
+      (a, ga, innerP) = (c, gc, p)
+      if side == -1:
+        gb *= 0.5
+      side = -1
+    else:
+      (b, gb) = (c, gc)
+      if side == 1:
+        ga *= 0.5
+      side = 1
+  0.5 * (a + b)
+
+proc checkProfile(fit: DrcFit) =
+  if fit.loss != Squared:
+    raise
+      newException(ValueError, "profile-likelihood intervals need a least-squares fit")
+  if fit.jointView:
+    raise newException(
+      ValueError,
+      "profile-likelihood intervals are not available for curves of a joint fit",
+    )
+
+proc profileData(
+    fit: DrcFit
+): tuple[x: seq[float], free: array[drcParamCount, bool], box: Box] =
+  result.x = newSeq[float](fit.doses.len)
+  for i, dose in fit.doses:
+    result.x[i] = log10(dose)
+  for param in DrcParam:
+    result.free[ord(param)] = param notin fit.fixed
+  result.box = (fit.lower.toVec, fit.upper.toVec)
+
+proc profileStep(fit: DrcFit, param: DrcParam): float =
+  ## The first step out from the estimate: its standard error, if usable.
+  if fit.se[param] > 0.0 and fit.se[param] < Inf:
+    fit.se[param]
+  else:
+    0.1 * max(abs(fit.params[param]), 1.0)
+
+proc profileCI*(
+    fit: DrcFit, param: DrcParam, level = 0.95, opts = FitOptions()
+): ConfInt =
+  ## Profile-likelihood confidence interval for `param`, as R's
+  ## `confint(nls fit)`: the values β at which
+  ## τ(β) = sqrt((S(β) − Ŝ)/σ²) equals the t quantile, where S(β) is the SSR
+  ## with `param` held at β and the other free parameters refitted. Unlike
+  ## the Wald interval (`confint`), it follows the curvature of the SSR, so
+  ## it can be asymmetric. An end is a bound if the data do not exclude the
+  ## bound (0 for Asymmetry), and ±Inf if the data do not bound the
+  ## parameter within 10·t standard errors of the estimate (where R gives NA). A fixed parameter's interval is its value; NaN without
+  ## residual degrees of freedom. `opts.lm` controls the refits.
+  ## Least-squares fits only, and not for the curves of a joint fit.
+  fit.checkProfile
+  let tq = fit.tQuantile(level)
+  let v = fit.params[param]
+  if param in fit.fixed:
+    return (v, v)
+  if not (fit.sigma > 0.0 and fit.sigma < Inf):
+    return (NaN, NaN)
+  let (x, free, box) = fit.profileData
+  let step = fit.profileStep(param)
+  var bounds: array[2, float]
+  for k, direction in [-1.0, 1.0]:
+    bounds[k] = profileEnd(
+      ll5,
+      x,
+      fit.responses,
+      fit.weights,
+      fit.params.toVec,
+      ord(param),
+      free,
+      box,
+      fit.ssr,
+      fit.sigma,
+      tq,
+      step,
+      direction,
+      opts.lm,
+    )
+  (bounds[0], bounds[1])
+
+proc ecxProfileCI*(
+    fit: DrcFit, pct: float, level = 0.95, opts = FitOptions()
+): ConfInt =
+  ## Profile-likelihood confidence interval for `ecx`: the model is
+  ## reparametrised with log10(ECx) in place of LogEC50, and that is profiled
+  ## as in `profileCI`, then back-transformed. An unbounded end is 0 or Inf.
+  ## Not available when LogEC50 is fixed or bounded.
+  checkPercent(pct)
+  fit.checkProfile
+  let tq = fit.tQuantile(level)
+  if LogEC50 in fit.fixed:
+    raise newException(ValueError, "LogEC50 is fixed, so ECx cannot be profiled")
+  if fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
+    raise newException(ValueError, "LogEC50 is bounded, so ECx cannot be profiled")
+  if not (fit.sigma > 0.0 and fit.sigma < Inf):
+    return (NaN, NaN)
+  let r =
+    if fit.params[Hill] > 0.0:
+      pct / 100.0
+    else:
+      1.0 - pct / 100.0
+  # q is the parameter vector with q[LogEC50] = log10(ECx). From
+  # `logDoseAtFraction`, LogEC50 = log10(ECx) + z/Hill, z = log10(r^(−1/A) − 1).
+  let model = proc(x: float, q: ParamVec, grad: var ParamVec): float =
+    let
+      h = q[ord(Hill)]
+      a = q[ord(Asymmetry)]
+      v = pow(r, -1.0 / a)
+      z = log10(v - 1.0)
+    var p = q
+    p[ord(LogEC50)] = q[ord(LogEC50)] + z / h
+    result = ll5(x, p, grad)
+    let dl = grad[ord(LogEC50)]
+    grad[ord(Hill)] -= dl * z / (h * h)
+    grad[ord(Asymmetry)] += dl * v * ln(r) / (a * a * (v - 1.0) * ln(10.0) * h)
+  let (x, free, box) = fit.profileData
+  var q = fit.params.toVec
+  let (logEcx, grad) = fit.logEcxAndGradient(pct)
+  q[ord(LogEC50)] = logEcx
+  var step = sqrt(fit.deltaVariance(grad, LogEC50 .. Asymmetry))
+  if not (step > 0.0 and step < Inf):
+    step = 0.1
+  var bounds: array[2, float]
+  for k, direction in [-1.0, 1.0]:
+    bounds[k] = pow(
+      10.0,
+      profileEnd(
+        model,
+        x,
+        fit.responses,
+        fit.weights,
+        q,
+        ord(LogEC50),
+        free,
+        box,
+        fit.ssr,
+        fit.sigma,
+        tq,
+        step,
+        direction,
+        opts.lm,
+      ),
+    )
+  (bounds[0], bounds[1])
+
+proc ec50ProfileCI*(fit: DrcFit, level = 0.95, opts = FitOptions()): ConfInt =
+  fit.ecxProfileCI(50.0, level, opts)
 
 func better[R](a, b: R): bool =
   ## A lower SSR wins, and any finite SSR beats NaN. Within rounding of each
@@ -549,6 +885,9 @@ proc fitCurve*(
       (lo, hi)
     else:
       (NaN, NaN)
+  result.doses = @doses
+  result.responses = @responses
+  result.weights = w
 
   let (fixedValues, fixedParams) = resolveFixed(model, fixed)
   result.fixed = fixedParams
