@@ -131,28 +131,63 @@ proc checkPercent(pct: float) =
   if not (pct > 0.0 and pct < 100.0):
     raise newException(ValueError, "percentage must be in (0, 100), got " & $pct)
 
+func logDoseAtFraction(
+    fit: DrcFit, r: float
+): tuple[x, dxdr: float, grad: array[DrcParam, float]] =
+  ## The log10 dose x at which the curve is the fraction r = sᴬ of the way
+  ## from Bottom to Top, where s = 1/(1 + 10^z) and z = (LogEC50 − x)·Hill,
+  ## with ∂x/∂r and the gradient of x with respect to LogEC50, Hill and
+  ## Asymmetry. Solving gives x = LogEC50 − z/Hill with z = log10(r^(−1/A) − 1).
+  let
+    h = fit.params[Hill]
+    a = fit.params[Asymmetry]
+    v = pow(r, -1.0 / a)
+    z = log10(v - 1.0)
+  result.x = fit.params[LogEC50] - z / h
+  result.dxdr = v / (a * r * (v - 1.0) * ln(10.0) * h)
+  result.grad[LogEC50] = 1.0
+  result.grad[Hill] = z / (h * h)
+  result.grad[Asymmetry] = -v * ln(r) / (a * a * (v - 1.0) * ln(10.0) * h)
+
 func logEcxAndGradient(fit: DrcFit, pct: float): (float, array[DrcParam, float]) =
   ## log10(ECx) and its gradient with respect to the parameters.
   ##
   ## The fraction of the change from the low-dose plateau is sᴬ for a rising
-  ## curve and 1 − sᴬ for a falling one, where s = 1/(1 + 10^z) and
-  ## z = (LogEC50 − x)·Hill. Solving for x gives x = LogEC50 − z/Hill with
-  ## z = log10(r^(−1/A) − 1), r = pct/100 (rising) or 1 − pct/100 (falling).
+  ## curve and 1 − sᴬ for a falling one, so r = pct/100 (rising) or
+  ## 1 − pct/100 (falling). It does not depend on Bottom or Top.
+  let r =
+    if fit.params[Hill] > 0.0:
+      pct / 100.0
+    else:
+      1.0 - pct / 100.0
+  let at = fit.logDoseAtFraction(r)
+  (at.x, at.grad)
+
+func logDoseAtAndGradient(
+    fit: DrcFit, response: float
+): tuple[x, dxdy: float, grad: array[DrcParam, float]] =
+  ## log10 of the dose at which the fitted curve equals `response`, with
+  ## ∂x/∂response and the gradient with respect to all the parameters. NaN
+  ## unless `response` lies strictly between the plateaus of a curve that
+  ## is not flat.
   let
-    h = fit.params[Hill]
-    a = fit.params[Asymmetry]
-    r =
-      if h > 0.0:
-        pct / 100.0
-      else:
-        1.0 - pct / 100.0
-    v = pow(r, -1.0 / a)
-    z = log10(v - 1.0)
-  var grad: array[DrcParam, float]
-  grad[LogEC50] = 1.0
-  grad[Hill] = z / (h * h)
-  grad[Asymmetry] = -v * ln(r) / (a * a * (v - 1.0) * ln(10.0) * h)
-  (fit.params[LogEC50] - z / h, grad)
+    b = fit.params[Bottom]
+    t = fit.params[Top]
+    r = (response - b) / (t - b)
+  if not (r > 0.0 and r < 1.0) or fit.params[Hill] == 0.0:
+    result.x = NaN
+    result.dxdy = NaN
+    for param in DrcParam:
+      result.grad[param] = NaN
+    return
+  let at = fit.logDoseAtFraction(r)
+  # r = (response − Bottom)/(Top − Bottom), so ∂r/∂Bottom = −(1 − r)/(Top − Bottom)
+  # and ∂r/∂Top = −r/(Top − Bottom).
+  result.x = at.x
+  result.dxdy = at.dxdr / (t - b)
+  result.grad = at.grad
+  result.grad[Bottom] = -at.dxdr * (1.0 - r) / (t - b)
+  result.grad[Top] = -at.dxdr * r / (t - b)
 
 proc ecx*(fit: DrcFit, pct: float): float =
   ## Dose giving `pct`% of the change from the low-dose plateau to the
@@ -187,6 +222,56 @@ proc ecxCI*(fit: DrcFit, pct: float, level = 0.95): ConfInt =
 proc ec50CI*(fit: DrcFit, level = 0.95): ConfInt =
   fit.ecxCI(50.0, level)
 
+proc residualVariance(fit: DrcFit, weight: float): float =
+  if not (weight > 0.0 and weight < Inf):
+    raise newException(ValueError, "weight must be finite and positive, got " & $weight)
+  fit.sigma ^ 2 / weight
+
+proc checkResponse(response: float) =
+  if not response.isFinite:
+    raise newException(ValueError, "response must be finite, got " & $response)
+
+proc doseAt*(fit: DrcFit, response: float): float =
+  ## The dose at which the fitted mean response equals `response` (inverse
+  ## prediction). For data normalised to % of control, `doseAt(50.0)` is the
+  ## absolute IC50, where `ec50` is the relative one (half-way between the
+  ## fitted plateaus). NaN unless `response` lies strictly between the
+  ## plateaus. Doses outside `logDoseRange` are extrapolated.
+  checkResponse(response)
+  pow(10.0, fit.logDoseAtAndGradient(response).x)
+
+proc doseAtInterval(fit: DrcFit, response, level, observedVariance: float): ConfInt =
+  ## Delta method on log10 dose, back-transformed. `observedVariance` is the
+  ## variance of an observed response, 0 for a mean response.
+  checkResponse(response)
+  let tq = fit.tQuantile(level)
+  let (center, dxdy, grad) = fit.logDoseAtAndGradient(response)
+  let half =
+    tq *
+    sqrt(
+      fit.deltaVariance(grad, DrcParam.low .. DrcParam.high) +
+        dxdy * dxdy * observedVariance
+    )
+  (pow(10.0, center - half), pow(10.0, center + half))
+
+proc doseAtCI*(fit: DrcFit, response: float, level = 0.95): ConfInt =
+  ## Confidence interval for `doseAt`: where the dose lies at which the true
+  ## mean response is `response` (an absolute ECx). It uses the delta method
+  ## on log10 dose and is back-transformed, as `ecxCI`. For the dose of a
+  ## sample whose response was measured, use `calibrationCI`.
+  fit.doseAtInterval(response, level, 0.0)
+
+proc calibrationCI*(
+    fit: DrcFit, response: float, level = 0.95, weight = 1.0, replicates = 1
+): ConfInt =
+  ## Interval for the unknown dose of a sample with measured `response` (the
+  ## mean of `replicates` observations, each of relative `weight`), read off
+  ## the fitted curve as a standard curve. As `doseAtCI`, plus the variance
+  ## σ²/(`weight`·`replicates`) of the measured response.
+  if replicates < 1:
+    raise newException(ValueError, "replicates must be at least 1, got " & $replicates)
+  fit.doseAtInterval(response, level, fit.residualVariance(weight * float(replicates)))
+
 proc bandAt(fit: DrcFit, dose, tq, extraVariance: float): Band =
   ## The fitted response at `dose` ± tq·sqrt(Var(f̂) + extraVariance), with
   ## Var(f̂) = gᵀ·cov·g by the delta method.
@@ -211,11 +296,6 @@ proc confidenceBand*(fit: DrcFit, dose: float, level = 0.95): Band =
   ## The band at one dose. For many doses, the `openArray` overload computes
   ## the t quantile once.
   fit.bandAt(dose, fit.tQuantile(level), 0.0)
-
-proc residualVariance(fit: DrcFit, weight: float): float =
-  if not (weight > 0.0 and weight < Inf):
-    raise newException(ValueError, "weight must be finite and positive, got " & $weight)
-  fit.sigma ^ 2 / weight
 
 proc predictionBand*(
     fit: DrcFit, doses: openArray[float], level = 0.95, weight = 1.0

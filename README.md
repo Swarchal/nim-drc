@@ -7,7 +7,8 @@ Dose-response curve fitting for Nim, with no dependencies beyond the standard li
 - Zero-dose controls, fixed or bounded parameters and weighted fits
 - Robust fits (Huber, Tukey bisquare) that downweight or reject outliers
 - Standard errors, t-based confidence intervals, R², AIC/BIC
-- EC50 and any ECx (EC10, EC90, …) with confidence intervals
+- EC50 and any ECx (EC10, EC90, …), relative or absolute, with confidence intervals
+- Inverse prediction: doses read off a standard curve, with calibration intervals
 - Confidence and prediction bands for the fitted curve
 - Joint fits of several curves with shared parameters (e.g. parallel curves),
   relative potency with confidence intervals, and F tests between nested fits
@@ -288,6 +289,79 @@ dose   fitted   95% confidence    95% prediction
 - Both take a single dose or a sequence (as here, for plotting), and return
   `(fit, lower, upper)` tuples.
 
+### Reading doses off a curve (inverse prediction, absolute IC50)
+
+`doseAt(fit, response)` is the dose at which the fitted curve gives
+`response`, for example to read unknowns off a standard curve:
+
+```nim
+import std/[math, strformat]
+import drc
+
+# ELISA standards (pg/ml) in duplicate, and their optical densities
+let standards = [
+  0.0, 0.0, 15.6, 15.6, 31.25, 31.25, 62.5, 62.5, 125.0, 125.0, 250.0, 250.0, 500.0,
+  500.0, 1000.0, 1000.0,
+]
+let od = [
+  0.05, 0.05, 0.177, 0.174, 0.323, 0.318, 0.61, 0.634, 1.035, 1.031, 1.596, 1.59, 2.028,
+  1.965, 2.309, 2.359,
+]
+let curve = fitLL4(standards, od)
+
+# Unknown samples: the mean OD of duplicate wells
+for (name, sampleOd) in [("S1", 0.412), ("S2", 1.35), ("S3", 2.71)]:
+  let conc = curve.doseAt(sampleOd)
+  if conc.isNaN:
+    echo &"{name}: OD {sampleOd:.3f} is outside the curve's range"
+  else:
+    let ci = curve.calibrationCI(sampleOd, replicates = 2)
+    echo &"{name}: OD {sampleOd:.3f} -> {conc:5.1f} pg/ml (95% CI {ci.lower:.1f}–{ci.upper:.1f})"
+```
+
+```
+S1: OD 0.412 ->  40.1 pg/ml (95% CI 35.5–45.2)
+S2: OD 1.350 -> 187.1 pg/ml (95% CI 176.1–198.8)
+S3: OD 2.710 is outside the curve's range
+```
+
+- **`doseAt`** is NaN unless the response lies strictly between the fitted
+  plateaus. A dose outside the standards (see `fit.logDoseRange`) is
+  extrapolated.
+- **`calibrationCI(fit, response, level, weight, replicates)`** is the
+  interval for the unknown dose of a measured sample. It combines the
+  curve's uncertainty with the measurement's own, σ²/(`weight`·`replicates`).
+- **`doseAtCI(fit, response, level)`** has only the curve's uncertainty:
+  it is the interval for the dose at which the *mean* response is `response`.
+
+Both use the delta method on log10 dose, back-transformed, as `ecxCI`.
+
+`doseAtCI` also gives the **absolute IC50**. `ec50` is the relative IC50,
+half-way between the fitted plateaus. For data normalised to % of control,
+the absolute IC50 is where the curve crosses 50%. The two differ when the
+plateaus are not at 0 and 100:
+
+```nim
+let doses = [1e-9, 1e-9, 1e-8, 1e-8, 1e-7, 1e-7, 1e-6, 1e-6, 1e-5, 1e-5] # molar
+# % of control
+let viability = [101.3, 97.8, 96.1, 99.0, 78.2, 74.9, 31.5, 36.0, 4.1, 1.2]
+let fit = fitLL4(doses, viability)
+let rel = fit.ec50CI
+let ab = fit.doseAtCI(50.0)
+echo &"plateaus: {fit.params[Bottom]:.1f} and {fit.params[Top]:.1f}"
+echo &"relative IC50 = {fit.ec50 * 1e9:.1f} nM (95% CI {rel.lower * 1e9:.1f}–{rel.upper * 1e9:.1f})"
+echo &"absolute IC50 = {fit.doseAt(50.0) * 1e9:.1f} nM (95% CI {ab.lower * 1e9:.1f}–{ab.upper * 1e9:.1f})"
+```
+
+```
+plateaus: -7.6 and 101.4
+relative IC50 = 517.7 nM (95% CI 362.4–739.5)
+absolute IC50 = 445.4 nM (95% CI 369.5–536.9)
+```
+
+The relative IC50's interval does not depend on the plateaus' uncertainty
+(it is always half-way between them), but the absolute IC50's does.
+
 ### Weights
 
 Weights are relative, as in R's `nls`: observation i is taken to have error
@@ -555,7 +629,7 @@ For the parameter covariance, build JᵀWJ at the solution with
 
 | File | Contents |
 |---|---|
-| `src/drc.nim` | public API: `fitCurve` (and `fitLL3`/`fitLL4`/`fitLL5`), `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `predict`, `confidenceBand`, `predictionBand` |
+| `src/drc.nim` | public API: `fitCurve` (and `fitLL3`/`fitLL4`/`fitLL5`), `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `doseAt`, `doseAtCI`, `calibrationCI`, `predict`, `confidenceBand`, `predictionBand` |
 | `src/drc/multi.nim` | joint fits of several curves: `fitMulti` (and `fitLL4Multi` etc.), `MultiFit`, `param`, `cov`, `relativePotency`, `fTest` (included by `drc.nim`) |
 | `src/drc/models.nim` | the 5PL model with its analytic gradient, and initial guesses |
 | `src/drc/lm.nim` | Levenberg–Marquardt for weighted least squares |
