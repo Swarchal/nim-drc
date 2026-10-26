@@ -452,12 +452,13 @@ proc profileEnd[F, V, B](
   ## `tq`, then finds the crossing by the Illinois method. Each refit starts
   ## from the nearest point inside the crossing, so the profile follows one
   ## valley. If τ stays below `tq` up to a bound, the bound is the end (0 for
-  ## a `positive` parameter, i.e. Asymmetry). As R's `profile.nls`, the
-  ## profile is followed only to 10·`tq` steps from the estimate, and if τ has not
-  ## reached `tq` by then the end is ±Inf (a finite bound beyond that is
-  ## still tried): far out, the refits are poorly conditioned (on a partial
-  ## curve, a plateau runs off to infinity) and can stop short of the
-  ## minimum, which would look like a crossing.
+  ## a `positive` parameter, i.e. Asymmetry, which is approached but never
+  ## evaluated). As R's `profile.nls`, the profile is followed only to
+  ## 10·`tq` steps from the estimate: far out, the refits are poorly
+  ## conditioned (on a partial curve, a plateau runs off to infinity) and can
+  ## stop short of the minimum, which would look like a crossing. If τ has
+  ## not reached `tq` by then, the data are taken not to bound the parameter,
+  ## and the end is the bound (±Inf if none) without a refit there.
   var pinned = free
   pinned[j] = false
   let open = positive and direction < 0.0 and not (lower[j] > 0.0)
@@ -485,10 +486,8 @@ proc profileEnd[F, V, B](
         beta = 0.5 * (inner + limit) # approach 0 without reaching it
       else:
         (beta, atLimit) = (limit, true)
-    if not atLimit and abs(beta - pHat[j]) > reach:
-      if not limit.isFinite:
-        return direction * Inf
-      (beta, atLimit) = (limit, true)
+    if abs(beta - pHat[j]) > reach:
+      return limit
     let t = profileTau(
       fn, x, y, w, j, beta, innerP, pinned, lower, upper, ssrHat, sigma, lm, p
     )

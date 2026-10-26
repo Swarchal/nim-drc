@@ -304,7 +304,9 @@ intervals hide that. The profile intervals show it as an infinite end.
   off to infinity, and the refits stop being reliable.
 - **Bounds:** if the data do not exclude a bound, the bound is the end. In
   the bounded example above, Bottom's interval starts at 0 and Top's ends
-  at 100. Asymmetry's interval stops at 0.
+  at 100. Asymmetry's interval stops at 0. A bound further out than 10·t
+  standard errors is taken as the end without a refit there, for the same
+  reason as an infinite end.
 - **For ECx**, the model is rewritten with log10(ECx) in place of LogEC50,
   which is then profiled. It works for 5PL fits too, and is not available
   when LogEC50 is fixed or bounded.
