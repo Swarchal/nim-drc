@@ -53,6 +53,27 @@ suite "stored data and residuals":
       ss += v * v
     check close(ss, float(fit.df), 1e-10)
 
+  test "Pearson residuals without a usable σ":
+    # As many free parameters as observations with weight: σ is NaN.
+    let exact = fitLL4(
+      [0.1, 1.0, 10.0, 100.0, 1000.0],
+      [1.0, 3.0, 8.0, 9.0, 50.0],
+      [1.0, 1.0, 1.0, 1.0, 0.0],
+    )
+    check exact.df == 0
+    var r = exact.pearsonResiduals
+    check r[4] == 0.0
+    for v in r[0 .. 3]:
+      check v.isNaN
+    # An exact fit, σ = 0.
+    var weights = newSeqWith(24, 1.0)
+    weights[3] = 0.0
+    var zero = fitLL4(ryegrassDose, ryegrassRootLength, weights)
+    zero.sigma = 0.0
+    r = zero.pearsonResiduals
+    check r[3] == 0.0
+    check r[0].isNaN
+
   test "weighted Pearson residuals match R, and zero weights give 0":
     var weights: seq[float]
     for i in 0 ..< 8:
@@ -142,6 +163,35 @@ suite "lack-of-fit test":
     const response = potencyResponse
     let fit = fitLL4Multi(doses, response, curve, shared = {Bottom, Top, Hill})
     checkTest(fit.lackOfFit, 1.6517296515743194, 21, 27, 0.10926207189636181)
+
+  test "identical replicates give no pure error":
+    # Responses read to the instrument's resolution: each dose's triplicates
+    # are equal, so there is no scatter to test the curve against.
+    var doses, resp: seq[float]
+    for (d, y) in [(0.1, 9.1), (1.0, 8.3), (10.0, 5.7), (100.0, 2.3), (1000.0, 1.1)]:
+      doses.add [d, d, d]
+      resp.add [y, y, y]
+    expect ValueError:
+      discard fitLL4(doses, resp).lackOfFit
+    # Scatter at one dose is enough, and the identical doses add exactly 0.
+    resp[1] = 9.2
+    let t = fitLL4(doses, resp).lackOfFit
+    check t.df1 == 1
+    check t.df2 == 10
+    check t.f > 0.0 and t.f < Inf
+    # Joint fits pool the pure error over curves in the same way.
+    let joint = fitLL4Multi(
+      doses & doses, resp & resp, newSeqWith(15, 0) & newSeqWith(15, 1), shared = {Hill}
+    )
+    check joint.lackOfFit.f < Inf
+    resp[1] = 9.1
+    expect ValueError:
+      discard fitLL4Multi(
+        doses & doses,
+        resp & resp,
+        newSeqWith(15, 0) & newSeqWith(15, 1),
+        shared = {Hill},
+      ).lackOfFit
 
   test "unsuitable fits are rejected":
     # No replicates.

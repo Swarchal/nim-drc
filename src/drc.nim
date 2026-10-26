@@ -345,16 +345,27 @@ proc residuals*(fit: DrcFit): seq[float] =
 proc pearsonResiduals*(fit: DrcFit): seq[float] =
   ## √wᵢ·(yᵢ − f(xᵢ))/σ, as R's `residuals(type = "pearson")`: roughly unit
   ## variance under the fitted weights, so values beyond ±2–3 stand out. For
-  ## a robust fit, σ is the robust scale. 0 for zero-weight observations.
+  ## a robust fit, σ is the robust scale. 0 for zero-weight observations;
+  ## NaN for the others when σ is 0 (an exact fit) or unavailable (no
+  ## residual degrees of freedom).
   result = fit.residuals
+  let usable = fit.sigma > 0.0 and fit.sigma < Inf
   for i in 0 ..< result.len:
-    result[i] = sqrt(fit.weights[i]) * result[i] / fit.sigma
+    result[i] =
+      if fit.weights[i] == 0.0:
+        0.0
+      elif usable:
+        sqrt(fit.weights[i]) * result[i] / fit.sigma
+      else:
+        NaN
 
 proc pureError(
     doses, responses, weights: openArray[float]
 ): tuple[ss: float, groups: int] =
   ## The weighted sum of squares about each dose's weighted mean response,
-  ## and the number of doses, over observations with non-zero weight.
+  ## and the number of doses, over observations with non-zero weight. A dose
+  ## whose responses are all equal adds exactly 0 (not the rounding error of
+  ## its mean).
   var points: seq[(float, int)] # (dose, observation), sorted by dose
   for i in 0 ..< doses.len:
     if weights[i] > 0.0:
@@ -364,13 +375,16 @@ proc pureError(
   while k < points.len:
     var j = k
     var sumW, sumWY = 0.0
+    var equal = true
     while j < points.len and points[j][0] == points[k][0]:
       let i = points[j][1]
       sumW += weights[i]
       sumWY += weights[i] * responses[i]
+      equal = equal and responses[i] == responses[points[k][1]]
       inc j
-    for (_, i) in points[k ..< j]:
-      result.ss += weights[i] * (responses[i] - sumWY / sumW) ^ 2
+    if not equal:
+      for (_, i) in points[k ..< j]:
+        result.ss += weights[i] * (responses[i] - sumWY / sumW) ^ 2
     inc result.groups
     k = j
 
@@ -390,6 +404,12 @@ proc lackOfFitTest(ssr: float, df, n: int, pe: tuple[ss: float, groups: int]): F
       "a lack-of-fit test needs more doses than fitted parameters, got " & $pe.groups &
         " doses for " & $(n - df) & " parameters",
     )
+  if pe.ss == 0.0:
+    raise newException(
+      ValueError,
+      "a lack-of-fit test needs scatter among replicates, but every dose's " &
+        "replicates are identical",
+    )
   let f = ((ssr - pe.ss) / float(df1)) / (pe.ss / float(df2))
   (f, df1, df2, fTail(f, float(df1), float(df2)))
 
@@ -399,9 +419,9 @@ proc lackOfFit*(fit: DrcFit): FTest =
   ## scatter among replicates as pure error, as R's
   ## `anova(fit, lm(y ~ factor(dose)))` and drc's `modelFit`. A small p means
   ## the curve misses the dose means by more than replicate scatter explains.
-  ## Needs replicates at some dose and more doses than free parameters. Not
-  ## available for robust fits or for the curves of a joint fit (use
-  ## `lackOfFit` on the `MultiFit`).
+  ## Needs replicates that differ at some dose, and more doses than free
+  ## parameters. Not available for robust fits or for the curves of a joint
+  ## fit (use `lackOfFit` on the `MultiFit`).
   if fit.loss != Squared:
     raise newException(ValueError, "a lack-of-fit test needs a least-squares fit")
   if fit.jointView:
