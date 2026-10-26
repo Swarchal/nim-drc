@@ -15,9 +15,9 @@ type
   Bootstrap*[T] = object
     fit*: T ## the original fit
     replicates*: seq[T]
-      ## the refits that converged; they do not keep their data
-      ## (`doses`, `responses`, `weights`), so `residuals` and the tests
-      ## need the original fit
+      ## the refits that converged, each an ordinary fit to its resampled
+      ## data (which it keeps, so `residuals`, `lackOfFit` and the profile
+      ## intervals work on it)
     failed*: int ## resamples whose refit did not converge, left out
     resample*: Resample
 
@@ -54,17 +54,6 @@ proc residualPool(
 proc checkReplicates(n: int) =
   if n < 1:
     raise newException(ValueError, "need at least 1 replicate, got " & $n)
-
-proc stripData(fit: var DrcFit) =
-  fit.doses = @[]
-  fit.responses = @[]
-  fit.weights = @[]
-  fit.robustWeights = @[]
-
-proc stripData(fit: var MultiFit) =
-  fit.data = default(typeof(fit.data))
-  for c in fit.curves.mitems:
-    c.stripData
 
 proc resampleFits[T](
     boot: var Bootstrap[T],
@@ -107,9 +96,8 @@ proc resampleFits[T](
           w.add weights[i]
           cs.add c
     try:
-      var r = refit(d, y, w, cs)
+      let r = refit(d, y, w, cs)
       if r.converged:
-        r.stripData
         boot.replicates.add r
       else:
         inc boot.failed

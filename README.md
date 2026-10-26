@@ -364,7 +364,8 @@ or partial curves, as in the profile example above.
 - **Each refit** uses the original model, fixed parameters, bounds and loss
   (so robust fits stay robust). `opts` sets the optimiser options. Refits
   that do not converge are left out and counted in `boot.failed`.
-- **`boot.replicates`** holds the refits, without their data. `bootValues`
+- **`boot.replicates`** holds the refits, each an ordinary fit to its
+  resampled data, so anything that works on a fit works on them. `bootValues`
   gives the statistic for each refit, for a histogram.
 - **`bootCI`** gives percentile intervals, as R's
   `boot.ci(type = "perc")`, so they respect transformations like log dose.

@@ -107,7 +107,7 @@ suite "bootstrap: ryegrass 4PL":
     check a.bootValues(ec50) == b.bootValues(ec50)
     check a.bootValues(ec50) != c.bootValues(ec50)
 
-  test "replicates keep the settings and drop the data":
+  test "replicates keep the settings":
     let fixed = fitLL4(
       ryegrassDose,
       ryegrassRootLength,
@@ -119,8 +119,24 @@ suite "bootstrap: ryegrass 4PL":
       check r.params[Bottom] == 0.0
       check r.model == LL4
       check r.lower[Hill] == -10.0
-      check r.doses.len == 0
     check b.fit.doses == @ryegrassDose
+
+  test "replicates are ordinary fits to their resampled data":
+    # Data-dependent results on a replicate match a fresh fit to its data.
+    for resample in [Residuals, Cases]:
+      for r in fit.bootstrap(n = 5, resample = resample).replicates:
+        check r.doses.len == 24
+        if resample == Residuals:
+          check r.doses == @ryegrassDose
+          check r.responses != @ryegrassRootLength
+        let fresh = fitLL4(r.doses, r.responses, r.weights)
+        check close(fresh.ssr, r.ssr, 1e-8)
+        check close(r.residuals.mapIt(it * it).sum, r.ssr, 1e-10)
+        let (a, b) = (r.profileCI(Hill), fresh.profileCI(Hill))
+        check abs(a.lower) < Inf and abs(a.upper) < Inf
+        check close(a.lower, b.lower, 1e-6)
+        check close(a.upper, b.upper, 1e-6)
+        check close(r.lackOfFit.f, fresh.lackOfFit.f, 1e-6)
 
   test "robust fits refit with their loss":
     let huber = fitLL4(ryegrassDose, ryegrassRootLength, opts = FitOptions(loss: Huber))
@@ -166,6 +182,22 @@ suite "bootstrap: joint fits":
     let ci = boot.bootCI(potency)
     check abs(ci.lower - 3.457358658) < 0.3 * 0.188875
     check abs(ci.upper - 4.191799379) < 0.3 * 0.188875
+
+  test "joint replicates are ordinary fits to their resampled data":
+    for r in fit.bootstrap(n = 3).replicates:
+      # Residual resampling keeps the curve ids, here in curve order.
+      var d, y: seq[float]
+      for c in r.curves:
+        d.add c.doses
+        y.add c.responses
+      check d == doses
+      let fresh = fitLL4Multi(d, y, curve, shared = {Bottom, Top, Hill})
+      let (a, b) =
+        (r.relativePotencyProfileCI(0, 1), fresh.relativePotencyProfileCI(0, 1))
+      check abs(a.lower) < Inf and abs(a.upper) < Inf
+      check close(a.lower, b.lower, 1e-6)
+      check close(a.upper, b.upper, 1e-6)
+      check close(r.lackOfFit.f, fresh.lackOfFit.f, 1e-6)
 
   test "replicates keep the shared parameters":
     let boot = fit.bootstrap(n = 10)
