@@ -158,3 +158,64 @@ suite "profile likelihood: a partial curve":
     for param in [Top, Hill]:
       let refit = fitLL4(doses, resp, fixed = [(param, fit.profileCI(param).upper)])
       check close(sqrt(refit.ssr - fit.ssr) / fit.sigma, tq, 1e-4)
+
+suite "profile likelihood: relative potency":
+  # R: indexed nls() fits of the README's potency data, reparametrised with
+  # log10 ECx(b) and d = log10(ECx(a)/ECx(b)) in place of LogEC50 for curves
+  # a and b (LogEC50 = log10 ECx + log10(1/r − 1)/Hill), with d profiled as
+  # above.
+  let response = [
+    0.037, 0.07, 0.059, 0.157, 0.207, 0.161, 0.498, 0.508, 1.048, 1.013, 1.632, 1.587,
+    1.832, 1.768, 2.002, 1.956, 1.987, 2.026, 0.138, 0.129, 0.269, 0.263, 0.574, 0.492,
+    1.175, 1.148, 1.645, 1.593, 1.868, 1.904, 2.021, 1.963, 2.006, 1.988, 1.942, 1.981,
+    0.036, 0.05, 0.101, 0.088, 0.069, 0.066, 0.167, 0.162, 0.306, 0.305, 0.799, 0.815,
+    1.375, 1.415, 1.789, 1.749, 1.944, 1.885,
+  ]
+  var doses: seq[float]
+  var curve: seq[int]
+  for c in 0 .. 2:
+    for k in 0 .. 8:
+      let dose = pow(10.0, -2.0 + 0.5 * float(k))
+      doses.add [dose, dose]
+      curve.add [c, c]
+  let parallel = fitLL4Multi(doses, response, curve, shared = {Bottom, Top, Hill})
+  let separate = fitLL4Multi(doses, response, curve)
+
+  test "parallel curves match R":
+    checkInterval(
+      parallel.relativePotencyProfileCI(0, 1), 3.4861125628264502, 4.1554784812591503
+    )
+    checkInterval(
+      parallel.relativePotencyProfileCI(0, 2), 0.18109733960896374, 0.21578108265642343
+    )
+    checkInterval(
+      parallel.relativePotencyProfileCI(2, 1, 10.0),
+      17.636929648581379,
+      21.019096402654903,
+    )
+
+  test "separate curves match R":
+    checkInterval(
+      separate.relativePotencyProfileCI(0, 1), 3.1506373939275805, 4.1381293525018625
+    )
+    # At EC10 the ratio depends on each curve's own Hill.
+    checkInterval(
+      separate.relativePotencyProfileCI(2, 1, 10.0),
+      13.486145663710765,
+      24.959736158078126,
+    )
+
+  test "swapping the curves inverts the interval":
+    let ab = separate.relativePotencyProfileCI(0, 1)
+    let ba = separate.relativePotencyProfileCI(1, 0)
+    check close(ab.lower, 1.0 / ba.upper, 1e-8)
+    check close(ab.upper, 1.0 / ba.lower, 1e-8)
+
+  test "unsuitable fits are rejected":
+    expect ValueError:
+      discard parallel.relativePotencyProfileCI(1, 1)
+    expect ValueError:
+      discard parallel.relativePotencyProfileCI(0, 3)
+    let sharedL = fitLL4Multi(doses, response, curve, shared = {LogEC50})
+    expect ValueError:
+      discard sharedL.relativePotencyProfileCI(0, 1, 10.0)

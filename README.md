@@ -6,7 +6,7 @@ Dose-response curve fitting for Nim, with no dependencies beyond the standard li
 - Levenberg–Marquardt with multi-start, and a Nelder–Mead fallback
 - Zero-dose controls, fixed or bounded parameters and weighted fits
 - Robust fits (Huber, Tukey bisquare) that downweight or reject outliers
-- Standard errors, t-based (Wald or profile-likelihood) confidence intervals, R², AIC/BIC, residuals and a lack-of-fit test
+- Standard errors, t-based (Wald or profile-likelihood) and bootstrap confidence intervals, R², AIC/BIC, residuals and a lack-of-fit test
 - EC50 and any ECx (EC10, EC90, …), relative or absolute, with confidence intervals
 - Inverse prediction: doses read off a standard curve, with calibration intervals
 - Confidence and prediction bands for the fitted curve
@@ -312,6 +312,70 @@ intervals hide that. The profile intervals show it as an infinite end.
   long as one fit (0.25 ms for the ryegrass 4PL). Least-squares fits only,
   and not for the curves of a joint fit. `opts.lm` controls the refits.
 
+### Bootstrap intervals
+
+`bootstrap(fit)` refits the model to many resampled copies of the data, and
+`bootCI(boot, statistic)` takes percentiles of any function of a fit over
+those refits. Neither relies on the delta method or on the shape of the SSR:
+
+```nim
+import std/strformat
+import drc
+
+let doses = [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.94, 0.94, 0.94, 1.88, 1.88, 1.88, 3.75, 3.75, 3.75,
+  7.5, 7.5, 7.5, 15.0, 15.0, 15.0, 30.0, 30.0, 30.0,
+]
+let rootLength = [
+  7.58, 8.0, 8.3285714, 7.25, 7.375, 7.9625, 8.3555556, 6.9142857, 7.75, 6.8714286,
+  6.45, 5.9222222, 1.925, 2.8857143, 4.2333333, 1.1875, 0.8571429, 1.0571429, 0.6875,
+  0.525, 0.825, 0.25, 0.22, 0.44,
+]
+let fit = fitLL4(doses, rootLength)
+let boot = fit.bootstrap() # 2000 refits of resampled data
+echo &"{boot.replicates.len} refits, {boot.failed} failed"
+
+proc show(name: string, ci: ConfInt) =
+  echo &"{name:<10} [{ci.lower:.3f}, {ci.upper:.3f}]"
+
+show "Wald", fit.ec50CI
+show "profile", fit.ec50ProfileCI
+show "bootstrap", boot.bootCI(ec50)
+# Any function of a fit: here the dose giving a root length of 4
+show "dose at 4", boot.bootCI(proc(f: DrcFit): float = f.doseAt(4.0))
+```
+
+```
+2000 refits, 0 failed
+Wald       [2.694, 3.471]
+profile    [2.691, 3.475]
+bootstrap  [2.710, 3.464]
+dose at 4  [2.851, 3.477]
+```
+
+On data as clean as these, all three methods agree. They part ways on sparse
+or partial curves, as in the profile example above.
+
+- **`resample`:** `Residuals` (the default) adds residuals drawn with
+  replacement to the fitted values. It assumes the model and weights are
+  right. `Cases` draws whole observations with replacement, which does not
+  assume that, but needs more data, since a resample can miss doses. The
+  residuals are centred and scaled by sqrt(n/df) so their spread matches σ.
+- **Each refit** uses the original model, fixed parameters, bounds and loss
+  (so robust fits stay robust). `opts` sets the optimiser options. Refits
+  that do not converge are left out and counted in `boot.failed`.
+- **`boot.replicates`** holds the refits, without their data. `bootValues`
+  gives the statistic for each refit, for a histogram.
+- **`bootCI`** gives percentile intervals, as R's
+  `boot.ci(type = "perc")`, so they respect transformations like log dose.
+  Non-finite values (e.g. `doseAt` outside a refit's range) are left out.
+- **`n`** defaults to 2000. Use at least 1000 for a 95% interval, since its
+  ends rest on the extreme 2.5% of refits. `seed` makes the resampling
+  reproducible. 2000 refits of a 4PL take about half a second.
+- **Joint fits:** `bootstrap(multiFit)` works the same way. Residuals are
+  drawn from all curves together (the fit has one σ), and cases within each
+  curve. See the potency example below.
+
 ### Confidence and prediction bands
 
 Continuing the example above:
@@ -584,13 +648,40 @@ contain the simulated values (4 and 0.2).
   the reference.
   Its interval comes from the delta method on log10 of the ratio, using the
   joint covariance, so it is asymmetric. R drc's `EDcomp` uses the ratio scale
-  by default, which gives a symmetric interval.
+  by default, which gives a symmetric interval. For profile-likelihood and
+  bootstrap intervals, see below.
 - **`fTest(reduced, full)`** compares nested fits to the same data, as R's
   `anova`: for example parallel against separate curves, a 4PL against a 5PL,
   or one pooled curve (all curve ids 0) against several.
 - **`fixed`** parameters are held at one value for every curve.
 - Joint fits use least squares only, without the Nelder–Mead fallback.
   Starting values come from fitting each curve on its own.
+
+Continuing the example, the potency of sample A with three kinds of interval:
+
+```nim
+let boot = parallel.bootstrap()
+proc potencyOfA(f: MultiFit): float =
+  f.relativePotency(0, 1).ratio
+let delta = parallel.relativePotency(0, 1).ci
+let profile = parallel.relativePotencyProfileCI(0, 1)
+let percentile = boot.bootCI(potencyOfA)
+echo &"potency of A, 95% CI: delta {delta.lower:.3f}–{delta.upper:.3f}, profile {profile.lower:.3f}–{profile.upper:.3f}, bootstrap {percentile.lower:.3f}–{percentile.upper:.3f}"
+```
+
+```
+potency of A, 95% CI: delta 3.486–4.155, profile 3.486–4.155, bootstrap 3.491–4.150
+```
+
+- **`relativePotencyProfileCI(a, b, pct = 50)`** is the profile-likelihood
+  interval for the potency ratio. The joint model is rewritten with
+  log10(ECx(a)/ECx(b)) as a parameter, and that is profiled as in
+  `profileCI`. It needs LogEC50 to be fitted separately for each curve
+  (not shared, fixed or bounded).
+- **Fieller's theorem**, the classical choice for potency ratios, gives the
+  same interval as the delta method here. Fieller applies to a ratio of
+  estimates on the dose scale, but the potency here is a difference on the
+  log10 scale.
 
 ### Checking fit quality
 
@@ -723,12 +814,13 @@ For the parameter covariance, build JᵀWJ at the solution with
 | File | Contents |
 |---|---|
 | `src/drc.nim` | public API: `fitCurve` (and `fitLL3`/`fitLL4`/`fitLL5`), `DrcFit`, `FitOptions`, `summary`, `confint`, `ecx`, `ecxCI`, `doseAt`, `doseAtCI`, `calibrationCI`, `predict`, `fitted`, `residuals`, `pearsonResiduals`, `lackOfFit`, `profileCI`, `ecxProfileCI`, `ec50ProfileCI`, `confidenceBand`, `predictionBand` |
-| `src/drc/multi.nim` | joint fits of several curves: `fitMulti` (and `fitLL4Multi` etc.), `MultiFit`, `param`, `cov`, `relativePotency`, `fTest`, `lackOfFit` (included by `drc.nim`) |
+| `src/drc/multi.nim` | joint fits of several curves: `fitMulti` (and `fitLL4Multi` etc.), `MultiFit`, `param`, `cov`, `relativePotency`, `relativePotencyProfileCI`, `fTest`, `lackOfFit` (included by `drc.nim`) |
+| `src/drc/bootstrap.nim` | bootstrap intervals for single and joint fits: `bootstrap`, `Bootstrap`, `bootCI`, `bootValues` (included by `drc.nim`) |
 | `src/drc/models.nim` | the 5PL model with its analytic gradient, and initial guesses |
 | `src/drc/lm.nim` | Levenberg–Marquardt for weighted least squares |
 | `src/drc/neldermead.nim` | Nelder–Mead simplex minimisation |
 | `src/drc/robust.nim` | Huber and Tukey loss functions (ψ, weights, ψ′) and the MAD scale |
-| `src/drc/stats.nim` | incomplete beta, Student's t CDF and quantile, F upper tail, covariance, log-likelihood |
+| `src/drc/stats.nim` | incomplete beta, Student's t CDF and quantile, normal quantile, F upper tail, covariance, log-likelihood |
 | `src/drc/linalg.nim` | Cholesky solve and inverse, for fixed-size arrays or runtime-sized seqs |
 
 ## Validation
@@ -757,11 +849,18 @@ The tests compare against reference values from R:
 - **Profile-likelihood intervals:** the exact ends, found in R by root
   finding on the profile t statistic with `nls` refits (`port` within
   bounds), for 3PL, 4PL (weighted and unweighted), 5PL, bounded fits and a
-  partial curve, including ECx intervals. They agree with R's own
+  partial curve, including ECx intervals, and for relative potency in
+  joint fits (parallel and separate curves, EC50 and EC10). They agree with R's own
   spline-based `confint` to about 1e-4. R's refits stop short where a
   plateau runs off to infinity, so those ends are instead checked against a
   multi-start fit with the parameter fixed there.
-- **Distributions:** `qt`, `pt`, `pbeta` and `pf`.
+- **Bootstrap:** the percentile rule matches `boot.ci(type = "perc")`
+  exactly. The resampling cannot match R's random numbers, so it is checked
+  against the same residual and case schemes written independently in R with
+  10,000–20,000 refits, for a single fit and for relative potency in a joint
+  fit. The bootstrap SDs agree to 1.5% and the interval ends to under 0.1
+  bootstrap SDs, within Monte Carlo error.
+- **Distributions:** `qt`, `pt`, `pbeta`, `pf` and `qnorm`.
 - **Cross-checks:** the parameter estimates also agree with SciPy's `curve_fit`
   and with the LL.4 and ED10/50/90 estimates published for `drc`.
 - **Robustness:** a sparse dataset where a single start gets stuck in a local

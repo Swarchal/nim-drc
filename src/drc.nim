@@ -396,39 +396,40 @@ proc lackOfFit*(fit: DrcFit): FTest =
     fit.ssr, fit.df, fit.n, pureError(fit.doses, fit.responses, fit.weights)
   )
 
-proc profileTau[F](
+proc profileTau[F, V, B](
     fn: F,
     x, y, w: openArray[float],
     j: int,
     beta: float,
-    start: ParamVec,
-    pinned: array[drcParamCount, bool],
-    box: Box,
+    start: V,
+    pinned: B,
+    lower, upper: V,
     ssrHat, sigma: float,
     lm: LMOptions,
-    params: var ParamVec,
+    params: var V,
 ): float =
   ## The profile t statistic τ(β) = sqrt(S(β) − Ŝ)/σ, where S(β) is the SSR
   ## refitted from `start` with parameter j held at β; `params` gets the refit.
   ## Inf if the refit has no finite SSR.
   var p = start
   p[j] = beta
-  let r = levenbergMarquardt(fn, x, y, w, p, pinned, box.lower, box.upper, lm)
+  let r = levenbergMarquardt(fn, x, y, w, p, pinned, lower, upper, lm)
   params = r.params
   if r.ssr.isNaN:
     Inf
   else:
     sqrt(max(r.ssr - ssrHat, 0.0)) / sigma
 
-proc profileEnd[F](
+proc profileEnd[F, V, B](
     fn: F,
     x, y, w: openArray[float],
-    pHat: ParamVec,
+    pHat: V,
     j: int,
-    free: array[drcParamCount, bool],
-    box: Box,
+    free: B,
+    lower, upper: V,
     ssrHat, sigma, tq, step, direction: float,
     lm: LMOptions,
+    asymmetrySlot = ord(Asymmetry),
 ): float =
   ## One end of a profile-likelihood interval: the value β of parameter j,
   ## beyond pHat[j] in `direction` (±1), at which τ(β) reaches `tq`. It steps
@@ -436,7 +437,8 @@ proc profileEnd[F](
   ## `tq`, then finds the crossing by the Illinois method. Each refit starts
   ## from the nearest point inside the crossing, so the profile follows one
   ## valley. If τ stays below `tq` up to a bound, the bound is the end (0 for
-  ## Asymmetry, which must be positive). As R's `profile.nls`, the profile is
+  ## Asymmetry, which must be positive: `asymmetrySlot` says where it is, or
+  ## −1 if parameter j is not an Asymmetry). As R's `profile.nls`, the profile is
   ## followed only to 10·`tq` steps from the estimate, and if τ has not
   ## reached `tq` by then the end is ±Inf (a finite bound beyond that is
   ## still tried): far out, the refits are poorly conditioned (on a partial
@@ -444,14 +446,14 @@ proc profileEnd[F](
   ## minimum, which would look like a crossing.
   var pinned = free
   pinned[j] = false
-  let open = j == ord(Asymmetry) and direction < 0.0 and not (box.lower[j] > 0.0)
+  let open = j == asymmetrySlot and direction < 0.0 and not (lower[j] > 0.0)
   let limit =
     if direction > 0.0:
-      box.upper[j]
+      upper[j]
     elif open:
       0.0
     else:
-      box.lower[j]
+      lower[j]
   let reach = 10.0 * tq * step
   var
     inner = pHat[j]
@@ -460,7 +462,7 @@ proc profileEnd[F](
     outer, outerTau: float
     found = false
     h = step
-    p: ParamVec
+    p = pHat
   for _ in 0 ..< 60:
     var beta = inner + direction * h
     var atLimit = false
@@ -473,7 +475,9 @@ proc profileEnd[F](
       if not limit.isFinite:
         return direction * Inf
       (beta, atLimit) = (limit, true)
-    let t = profileTau(fn, x, y, w, j, beta, innerP, pinned, box, ssrHat, sigma, lm, p)
+    let t = profileTau(
+      fn, x, y, w, j, beta, innerP, pinned, lower, upper, ssrHat, sigma, lm, p
+    )
     if t >= tq:
       (outer, outerTau, found) = (beta, t, true)
       break
@@ -495,7 +499,8 @@ proc profileEnd[F](
     if not (c > min(a, b) and c < max(a, b)):
       c = 0.5 * (a + b) # e.g. gb = Inf
     let gc =
-      profileTau(fn, x, y, w, j, c, innerP, pinned, box, ssrHat, sigma, lm, p) - tq
+      profileTau(fn, x, y, w, j, c, innerP, pinned, lower, upper, ssrHat, sigma, lm, p) -
+      tq
     if gc == 0.0:
       return c
     if gc < 0.0:
@@ -569,7 +574,8 @@ proc profileCI*(
       fit.params.toVec,
       ord(param),
       free,
-      box,
+      box.lower,
+      box.upper,
       fit.ssr,
       fit.sigma,
       tq,
@@ -633,7 +639,8 @@ proc ecxProfileCI*(
         q,
         ord(LogEC50),
         free,
-        box,
+        box.lower,
+        box.upper,
         fit.ssr,
         fit.sigma,
         tq,
@@ -1166,3 +1173,5 @@ proc summary*(fit: DrcFit, level = 0.95): string =
     result.add &"\nWarning: {warning}"
 
 include drc/multi
+
+include drc/bootstrap

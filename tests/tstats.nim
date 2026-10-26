@@ -112,6 +112,31 @@ suite "Student's t":
     check studentTQuantile(1.5, 7.0).isNaN
     check studentTQuantile(0.975, 0.0).isNaN
 
+suite "normal quantile":
+  test "matches R's qnorm":
+    for (p, z) in [
+      (1e-300, -37.047096299361201),
+      (1e-20, -9.2623400897984052),
+      (1e-8, -5.61200124417479),
+      (0.001, -3.0902323061678132),
+      (0.025, -1.9599639845400538),
+      (0.1, -1.2815515655446008),
+      (0.3, -0.52440051270804067),
+      (0.7, 0.52440051270804067),
+      (0.9, 1.2815515655446008),
+      (0.975, 1.9599639845400536),
+      (0.999, 3.0902323061678132),
+      (1.0 - 1e-12, 7.0344869100478356),
+    ]:
+      check close(normalQuantile(p), z, 1e-14)
+
+  test "edge cases":
+    check normalQuantile(0.5) == 0.0
+    check normalQuantile(0.0) == NegInf
+    check normalQuantile(1.0) == Inf
+    check normalQuantile(-0.1).isNaN
+    check normalQuantile(NaN).isNaN
+
 suite "log-likelihood":
   test "matches R logLik.nls":
     # Ryegrass LL4 fit: SSR 5.400214650161578 over 24 observations.

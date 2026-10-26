@@ -67,6 +67,22 @@ proc sharedStart(param: DrcParam, values: openArray[float]): float =
   else:
     median(values)
 
+proc jointModel(
+    x: seq[float], slots: seq[array[DrcParam, int]], curveIds: seq[int]
+): proc(i: float, p: seq[float], grad: var seq[float]): float =
+  ## The joint model: observation i's curve gets its parameters from the
+  ## joint vector, and LM sees the observation index as x.
+  result = proc(i: float, p: seq[float], grad: var seq[float]): float =
+    let k = int(i)
+    let curveSlots = slots[curveIds[k]]
+    var q, g5: ParamVec
+    for param in DrcParam:
+      q[ord(param)] = p[curveSlots[param]]
+    result = ll5(x[k], q, g5)
+    grad.setZero()
+    for param in DrcParam:
+      grad[curveSlots[param]] += g5[ord(param)]
+
 proc fitMulti*(
     model: Model,
     doses, responses: openArray[float],
@@ -249,21 +265,8 @@ proc fitMulti*(
       for i in 0 ..< s.len:
         s[i] = float(i)
       s
-    index = result.slots
-    curveIds = result.curveIds
     ys = @responses
-  # Observation i's curve gets its parameters from the joint vector; LM sees
-  # the observation index as x.
-  let joint = proc(i: float, p: seq[float], grad: var seq[float]): float =
-    let k = int(i)
-    let slots = index[curveIds[k]]
-    var q, g5: ParamVec
-    for param in DrcParam:
-      q[ord(param)] = p[slots[param]]
-    result = ll5(x[k], q, g5)
-    grad.setZero()
-    for param in DrcParam:
-      grad[slots[param]] += g5[ord(param)]
+    joint = jointModel(x, result.slots, result.curveIds)
 
   proc search(starts: seq[seq[float]], free: seq[bool]): LMDynResult =
     for k, start in starts:
@@ -346,9 +349,10 @@ proc fitMulti*(
     (v.lower, v.upper) = (result.lower, result.upper)
     v.loss = Squared
     for param in DrcParam:
-      v.params[param] = result.joint[index[c][param]]
+      v.params[param] = result.joint[result.slots[c][param]]
       for other in DrcParam:
-        v.cov[param][other] = result.jointCov[index[c][param]][index[c][other]]
+        v.cov[param][other] =
+          result.jointCov[result.slots[c][param]][result.slots[c][other]]
     for param in DrcParam:
       v.se[param] = sqrt(v.cov[param][param])
     v.n = nCurve[c]
@@ -454,14 +458,9 @@ proc cov*(fit: MultiFit, a: int, pa: DrcParam, b: int, pb: DrcParam): float =
   fit.checkCurve(b)
   fit.jointCov[fit.slots[a][pa]][fit.slots[b][pb]]
 
-proc relativePotency*(
-    fit: MultiFit, a, b: int, pct = 50.0, level = 0.95
-): tuple[ratio: float, ci: ConfInt] =
-  ## ECx of curve `a` divided by ECx of curve `b`, with a confidence interval
-  ## by the delta method on log10 of the ratio (so it is asymmetric), using
-  ## the joint covariance including the parts shared by the two curves.
-  ## R drc's `EDcomp` applies the delta method to the ratio itself by default,
-  ## which gives a symmetric interval.
+proc logPotency(fit: MultiFit, a, b: int, pct: float): tuple[center, variance: float] =
+  ## log10(ECx of curve a / ECx of curve b) and its delta-method variance
+  ## from the joint covariance.
   checkPercent(pct)
   fit.checkCurve(a)
   fit.checkCurve(b)
@@ -472,16 +471,140 @@ proc relativePotency*(
   for param in DrcParam:
     g[fit.slots[a][param]] += gradA[param]
     g[fit.slots[b][param]] -= gradB[param]
-  var variance = 0.0
   for i in 0 ..< g.len:
     if g[i] != 0.0:
       for j in 0 ..< g.len:
         if g[j] != 0.0:
-          variance += g[i] * fit.jointCov[i][j] * g[j]
-  let
-    center = logA - logB
-    half = fit.curves[a].tQuantile(level) * sqrt(variance)
+          result.variance += g[i] * fit.jointCov[i][j] * g[j]
+  result.center = logA - logB
+
+proc relativePotency*(
+    fit: MultiFit, a, b: int, pct = 50.0, level = 0.95
+): tuple[ratio: float, ci: ConfInt] =
+  ## ECx of curve `a` divided by ECx of curve `b`, with a confidence interval
+  ## by the delta method on log10 of the ratio (so it is asymmetric), using
+  ## the joint covariance including the parts shared by the two curves.
+  ## R drc's `EDcomp` applies the delta method to the ratio itself by default,
+  ## which gives a symmetric interval. See also `relativePotencyProfileCI`.
+  let (center, variance) = fit.logPotency(a, b, pct)
+  let half = fit.curves[a].tQuantile(level) * sqrt(variance)
   (pow(10.0, center), (pow(10.0, center - half), pow(10.0, center + half)))
+
+proc jointData(fit: MultiFit): tuple[doses, responses, weights: seq[float]] =
+  ## The data in their original order, gathered from the curves.
+  var next = newSeq[int](fit.curves.len)
+  for c in fit.curveIds:
+    let k = next[c]
+    result.doses.add fit.curves[c].doses[k]
+    result.responses.add fit.curves[c].responses[k]
+    result.weights.add fit.curves[c].weights[k]
+    inc next[c]
+
+proc slotBounds(fit: MultiFit): tuple[lower, upper: seq[float]] =
+  result.lower = newSeq[float](fit.joint.len)
+  result.upper = newSeq[float](fit.joint.len)
+  for slots in fit.slots:
+    for param in DrcParam:
+      result.lower[slots[param]] = fit.lower[param]
+      result.upper[slots[param]] = fit.upper[param]
+
+func zAndDerivative(r, a: float): tuple[z, dzda: float] =
+  ## z = log10(r^(−1/A) − 1), with LogEC50 = log10(ECx) + z/Hill (see
+  ## `logDoseAtFraction`), and ∂z/∂A.
+  let v = pow(r, -1.0 / a)
+  (log10(v - 1.0), v * ln(r) / (a * a * (v - 1.0) * ln(10.0)))
+
+proc relativePotencyProfileCI*(
+    fit: MultiFit, a, b: int, pct = 50.0, level = 0.95, opts = FitOptions()
+): ConfInt =
+  ## Profile-likelihood confidence interval for `relativePotency(a, b, pct)`.
+  ## The joint model is rewritten with log10(ECx) of curve `b` and
+  ## log10(ECx(a)/ECx(b)) in place of the two curves' LogEC50s, and the log
+  ## ratio is profiled as in `profileCI`, then back-transformed. An end is 0
+  ## or Inf if the data do not bound the ratio within 10·t standard errors.
+  ## Needs LogEC50 to be fitted separately for each curve: not shared, fixed
+  ## or bounded. `opts.lm` controls the refits.
+  if a == b:
+    raise newException(ValueError, "the two curves must differ")
+  let (center, variance) = fit.logPotency(a, b, pct)
+  let tq = fit.curves[a].tQuantile(level)
+  if LogEC50 in fit.shared:
+    raise newException(
+      ValueError, "LogEC50 is shared or fixed, so the potency ratio cannot be profiled"
+    )
+  if fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
+    raise newException(
+      ValueError, "LogEC50 is bounded, so the potency ratio cannot be profiled"
+    )
+  if not (fit.sigma > 0.0 and fit.sigma < Inf):
+    return (NaN, NaN)
+
+  proc fraction(c: int): float =
+    if fit.param(c, Hill) > 0.0:
+      pct / 100.0
+    else:
+      1.0 - pct / 100.0
+
+  let
+    (ra, rb) = (fraction(a), fraction(b))
+    (sa, sb) = (fit.slots[a][LogEC50], fit.slots[b][LogEC50])
+    (ha, hb) = (fit.slots[a][Hill], fit.slots[b][Hill])
+    (aa, ab) = (fit.slots[a][Asymmetry], fit.slots[b][Asymmetry])
+    data = fit.jointData
+  var x = newSeq[float](data.doses.len)
+  for i, dose in data.doses:
+    x[i] = log10(dose)
+  let joint = jointModel(x, fit.slots, fit.curveIds)
+  # q is the joint vector with q[sb] = log10 ECx(b) and q[sa] = the log ratio:
+  # LogEC50(b) = q[sb] + z_b/Hill_b and LogEC50(a) = q[sa] + q[sb] + z_a/Hill_a.
+  let model = proc(i: float, q: seq[float], grad: var seq[float]): float =
+    let
+      (za, dza) = zAndDerivative(ra, q[aa])
+      (zb, dzb) = zAndDerivative(rb, q[ab])
+    var p = q
+    p[sb] = q[sb] + zb / q[hb]
+    p[sa] = q[sa] + q[sb] + za / q[ha]
+    result = joint(i, p, grad)
+    let (ga, gb) = (grad[sa], grad[sb])
+    grad[sb] = gb + ga
+    grad[ha] -= ga * za / (q[ha] * q[ha])
+    grad[aa] += ga * dza / q[ha]
+    grad[hb] -= gb * zb / (q[hb] * q[hb])
+    grad[ab] += gb * dzb / q[hb]
+  var q = fit.joint
+  q[sb] = fit.curves[b].logEcxAndGradient(pct)[0]
+  q[sa] = center
+  var obs = newSeq[float](x.len)
+  for i in 0 ..< obs.len:
+    obs[i] = float(i)
+  let (lower, upper) = fit.slotBounds
+  var step = sqrt(variance)
+  if not (step > 0.0 and step < Inf):
+    step = 0.1
+  var bounds: array[2, float]
+  for k, direction in [-1.0, 1.0]:
+    bounds[k] = pow(
+      10.0,
+      profileEnd(
+        model,
+        obs,
+        data.responses,
+        data.weights,
+        q,
+        sa,
+        fit.jointFree,
+        lower,
+        upper,
+        fit.ssr,
+        fit.sigma,
+        tq,
+        step,
+        direction,
+        opts.lm,
+        asymmetrySlot = -1,
+      ),
+    )
+  (bounds[0], bounds[1])
 
 proc fTest*(reduced, full: MultiFit): FTest =
   ## F test of a reduced joint fit (e.g. parallel curves) against a fuller one
