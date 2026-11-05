@@ -15,7 +15,7 @@ nimble figures                                     # re-render docs/images (READ
 nimble vignettes                                   # re-render docs/vignettes; `nim c -r vignettes/knit.nim intervals` for one
 ```
 
-`figures` and `vignettes` need nim-plotter (`$PLOTTER_PATH`, default `../nim-plotter/src`) and `vl-convert` on PATH. plotter is not a drc dependency: only `examples/` and `vignettes/` import it.
+`figures` and `vignettes` need nim-plotter (`$PLOTTER_PATH`, default `../nim-plotter/src`) and `vl-convert` on PATH. The `dataframes` vignette also needs racoon (`$RACOON_PATH`, default `../Racoon/src`, else the installed package; the installed 0.1.0 prints tables without the dtype line, so render with the current checkout). plotter and racoon are not drc dependencies: only `examples/` and `vignettes/` import them. `vignettes/data/plate_screen.csv` is simulated data.
 
 `nimble test` stops at the first failing file, so a failure can hide later files. Compiled test binaries land next to their sources in `tests/`.
 
@@ -61,7 +61,6 @@ Design decisions that span files:
 - `vignettes/<name>.nim` are literate programs: column-0 `## ` lines are Markdown prose, everything else is code. `vignettes/knit.nim` runs each one and writes `docs/vignettes/<name>.md` with every chunk's code and real output, plus `docs/vignettes/README.md` (an index built from each title and first paragraph). Never edit the generated `.md` files. The order is the `vignettes` list in `knit.nim`.
 - Code from a column-0 `#| hide` line to the next prose or `#| hide` line runs but isn't shown. Prose and `#| hide` lines must not split a statement.
 - `vignettes/drcplot.nim` holds the plotting helpers, shared with `examples/figures.nim`. `figure(chart, name, alt)` writes `docs/vignettes/figures/<vignette>/<name>.png` and prints a marker that knit turns into an image link.
-- plotter drops the data of a nested `layer` whose children all share one data frame, and of a `layer` inside a `facet` (its hoisting bug in `vegalite.nim`). Give each chart inside a nested layer its own frame; for a faceted layer, put the frame on the layer with `withData` (see `screening.nim`).
 - Output must be deterministic (fixed seeds, no timings), so re-rendering only changes what actually changed.
 
 ## Testing conventions

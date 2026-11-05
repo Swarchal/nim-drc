@@ -18,8 +18,10 @@
 ##
 ## Usage: `nimble vignettes`, or `nim c -r vignettes/knit.nim [name ...]` to
 ## render only some (e.g. `intervals`). The vignettes use `plotter`, found
-## through `$PLOTTER_PATH` (default `../nim-plotter/src`), and need
-## `vl-convert` on PATH.
+## through `$PLOTTER_PATH` (default `../nim-plotter/src`), and `dataframes`
+## uses `racoon`, found through `$RACOON_PATH` (default `../Racoon/src`, or
+## the installed package if that does not exist). They need `vl-convert` on
+## PATH.
 
 import std/[os, osproc, sequtils, strformat, strutils, tempfiles]
 
@@ -27,7 +29,7 @@ const
   # In reading order. Each is `vignettes/<name>.nim`.
   vignettes = [
     "getting_started", "model_choice", "intervals", "outliers", "potency",
-    "standard_curves", "screening",
+    "standard_curves", "screening", "dataframes",
   ]
   chunkMarker = "\x1Echunk "
   figureMarker = "\x1Dfigure " # printed by `drcplot.figure`
@@ -93,6 +95,7 @@ proc instrument(chunks: seq[Chunk]): string =
 proc run(name, source, figureDir: string): string =
   ## Compile and run the instrumented vignette; its standard output.
   let plotterPath = getEnv("PLOTTER_PATH", "../nim-plotter/src")
+  let racoonPath = getEnv("RACOON_PATH", "../Racoon/src")
   let dir = createTempDir("drc-knit-", "")
   defer:
     removeDir(dir)
@@ -108,6 +111,7 @@ proc run(name, source, figureDir: string): string =
       "--path:src",
       "--path:vignettes",
       "--path:" & plotterPath,
+      "--path:" & racoonPath,
       "--nimcache:" & dir / "cache",
       "-o:" & dir / "vignette",
       file,

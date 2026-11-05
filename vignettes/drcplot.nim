@@ -134,8 +134,6 @@ proc curveLine*(a: DoseAxis, fit: DrcFit, yTitle: string, color = blue): Chart =
 proc bands*(a: DoseAxis, fit: DrcFit, color = blue, prediction = true): Chart =
   ## The fit's 95% confidence band, and (with `prediction`) its wider 95%
   ## prediction band behind it, as shaded areas.
-  # Each area has its own frame: plotter drops data that the charts inside a
-  # nested layer share (a bug in its hoisting), so they must share none.
   let grid = a.doseGrid
   let dose = grid.mapIt(a.toDisplay(it))
   let confidence = fit.confidenceBand(grid)
@@ -195,7 +193,6 @@ proc doseRule*(a: DoseAxis, dose: float, label = "", dy = -100.0): Chart =
     .encode(x = a.x)
   if label.len == 0:
     return rule
-  # Not the rule's frame: see `bands`.
   let text = chart(dataFrame(col("dose", at), col("label", @[label])))
     .markText(align = "left", dx = 6, dy = dy, color = ink, fontSize = 12)
     .encode(x = a.x, text = "label:N")

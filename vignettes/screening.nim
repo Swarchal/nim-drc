@@ -276,3 +276,5 @@ echo &"{covered} of {hits.len} intervals contain the true IC50"
 ## - [Confidence intervals](intervals.md): the wide or open-ended intervals
 ##   of partial curves like the weak compounds here.
 ## - [Outliers](outliers.md): robust fits for screens with bad wells.
+## - [Plate data in a data frame](dataframes.md): the same workflow from a
+##   plate reader CSV, with per-plate normalisation.
