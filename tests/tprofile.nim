@@ -47,24 +47,25 @@ suite "profile likelihood: ryegrass 4PL":
     let unit = fitLL4(ryegrassDose, ryegrassRootLength, fixed = [(Hill, -3.0)])
     check unit.profileCI(Hill) == (-3.0, -3.0)
     check unit.profileCI(Asymmetry) == (1.0, 1.0)
-    expect ValueError:
-      discard
-        fitLL4(ryegrassDose, ryegrassRootLength, fixed = [(LogEC50, 0.5)]).ec50ProfileCI
+    # With LogEC50 fixed, a 4PL's EC50 is known exactly.
+    let fixedL = fitLL4(ryegrassDose, ryegrassRootLength, fixed = [(LogEC50, 0.5)])
+    check fixedL.ec50ProfileCI == (fixedL.ec50, fixedL.ec50)
     expect ValueError:
       discard fitLL4(ryegrassDose, ryegrassRootLength, opts = FitOptions(loss: Huber))
         .profileCI(Hill)
+    # The curves of a joint fit are profiled through the MultiFit.
     let (doses, resp, curve) = ryegrassCurves(2.0)
     let joint = fitLL4Multi(doses, resp, curve, shared = {Bottom, Top, Hill})
     expect ValueError:
       discard joint.curves[0].profileCI(Hill)
+    expect ValueError:
+      discard joint.curves[0].ec50ProfileCI
 
   test "invalid arguments are rejected":
     expect ValueError:
       discard fit.profileCI(Hill, 1.0)
     expect ValueError:
       discard fit.ecxProfileCI(0.0)
-    expect ValueError:
-      discard fitLL4(ryegrassDose, ryegrassRootLength, bounds = [(LogEC50, 0.0 .. 1.0)]).ec50ProfileCI
 
 suite "profile likelihood: other fits":
   test "weighted fit matches R":
@@ -185,6 +186,121 @@ suite "profile likelihood: relative potency":
       discard parallel.relativePotencyProfileCI(1, 1)
     expect ValueError:
       discard parallel.relativePotencyProfileCI(0, 3)
-    let sharedL = fitLL4Multi(doses, response, curve, shared = {LogEC50})
+    let robust = fitLL4Multi(
+      doses,
+      response,
+      curve,
+      shared = {Bottom, Top, Hill},
+      opts = FitOptions(loss: Huber),
+    )
     expect ValueError:
-      discard sharedL.relativePotencyProfileCI(0, 1, 10.0)
+      discard robust.relativePotencyProfileCI(0, 1)
+
+  test "a bound on LogEC50 the data do not exclude shortens the interval":
+    # R: as above, with LogEC50 ≥ −0.6 (curve 1's estimate is −0.591): for a
+    # log ratio d, nls(algorithm = "port") refits with l0 = l1 + d and the
+    # bounds l1 ≥ max(−0.6, −0.6 − d), l2 ≥ −0.6.
+    let bounded = fitLL4Multi(
+      doses,
+      response,
+      curve,
+      shared = {Bottom, Top, Hill},
+      bounds = [(LogEC50, -0.6 .. Inf)],
+    )
+    checkInterval(
+      bounded.relativePotencyProfileCI(0, 1), 3.486112562696376, 4.1326164086258821
+    )
+
+suite "profile likelihood: ECx with LogEC50 fixed or bounded":
+  # R: the profile of log10(ECx) X, with one parameter eliminated through
+  # X = LogEC50 − log10(r^(−1/A) − 1)/Hill. With LogEC50 fixed in a 4PL, Hill
+  # is fixed by X and the refit is linear (lm on Bottom and Top). With
+  # LogEC50 ≤ 0.5, LogEC50 is eliminated and the bound becomes an upper bound
+  # on Hill for each X (nls with algorithm = "port"). In the 5PL, Asymmetry
+  # is eliminated: A = −ln r / ln(1 + 10^(Hill·(LogEC50 − X))).
+  test "4PL with LogEC50 fixed matches R":
+    let fit = fitLL4(ryegrassDose, ryegrassRootLength, fixed = [(LogEC50, 0.5)])
+    checkInterval(fit.ecxProfileCI(10.0), 1.1509342816796571, 1.8856478092545919)
+    checkInterval(fit.ecxProfileCI(90.0), 5.3032172555876498, 8.6885933968411759)
+
+  test "4PL with LogEC50 bounded matches R":
+    let fit =
+      fitLL4(ryegrassDose, ryegrassRootLength, bounds = [(LogEC50, -Inf .. 0.5)])
+    # The lower end is the unbounded one; the upper is held in by the bound.
+    checkInterval(fit.ecxProfileCI(10.0), 1.1023462816067795, 1.8792655500847208)
+    # τ at the bound is 0.553 in R, below the t quantile, so the bound is the end.
+    checkInterval(fit.ec50ProfileCI, 2.6910983092900738, pow(10.0, 0.5))
+
+  test "5PL with LogEC50 fixed matches R":
+    let fit = fitLL5(asymDose, asymResponse, fixed = [(LogEC50, -6.1)])
+    checkInterval(fit.ec50ProfileCI, 2.0217333244421984e-07, 2.512628483846457e-07)
+    checkInterval(
+      fit.ecxProfileCI(10.0), 4.9477682831767375e-09, 9.6282419503227812e-09
+    )
+
+suite "profile likelihood: curves of a joint fit":
+  # R: indexed nls() fits of the DNase data (see tmulti.nim), profiled as
+  # above with every curve refitted.
+  let (doses, curve) = dnase()
+  let parallel = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top, Hill})
+  let sharedL = fitLL4Multi(doses, dnaseDensity, curve, shared = {LogEC50})
+
+  test "parameters of parallel curves match R":
+    checkInterval(
+      parallel.profileCI(1, LogEC50), 0.57538531703871398, 0.66730225106263541
+    )
+    # Hill is shared, so every curve has the same interval.
+    checkInterval(parallel.profileCI(2, Hill), 0.94012662425104132, 1.0652756826770464)
+    check parallel.profileCI(0, Hill) == parallel.profileCI(2, Hill)
+    check parallel.profileCI(0, Asymmetry) == (1.0, 1.0)
+
+  test "ECx of a curve matches R":
+    # LogEC50 separate: rewritten as log10(EC10) + log10(9)/Hill for curve 2.
+    checkInterval(
+      parallel.ecxProfileCI(2, 10.0), 0.4079003021709558, 0.4739989469879804
+    )
+    # LogEC50 shared by all curves: curve 1's EC10 depends on its own Hill.
+    checkInterval(
+      sharedL.ecxProfileCI(1, 10.0), 0.41695951224214345, 0.5230326869298465
+    )
+
+  test "relative potency with a shared LogEC50 matches R":
+    # R: Hill of curve 0 eliminated, Hill₀ = z/(z/Hill₁ − d) with z = log10(9).
+    checkInterval(
+      sharedL.relativePotencyProfileCI(0, 1, 10.0),
+      0.80029372195873005,
+      1.1089698134619939,
+    )
+    # Their EC50s are both 10^LogEC50, so the ratio is exactly 1.
+    check sharedL.relativePotencyProfileCI(0, 1) == (1.0, 1.0)
+
+  test "for a 4PL, a curve's EC50 interval is its LogEC50 one back-transformed":
+    let ci = parallel.profileCI(0, LogEC50)
+    checkInterval(
+      parallel.ec50ProfileCI(0), pow(10.0, ci.lower), pow(10.0, ci.upper), 1e-8
+    )
+
+  test "one curve is the single-curve fit":
+    let joint =
+      fitLL4Multi(ryegrassDose, ryegrassRootLength, newSeq[int](ryegrassDose.len))
+    let single = fitLL4(ryegrassDose, ryegrassRootLength)
+    checkInterval(joint.profileCI(0, Hill), -4.2328922557496984, -2.1820088143027823)
+    let ci = single.ecxProfileCI(10.0)
+    checkInterval(joint.ecxProfileCI(0, 10.0), ci.lower, ci.upper, 1e-8)
+
+  test "robust fits and missing curves are rejected":
+    let robust = fitLL4Multi(
+      doses,
+      dnaseDensity,
+      curve,
+      shared = {Bottom, Top, Hill},
+      opts = FitOptions(loss: Huber),
+    )
+    expect ValueError:
+      discard robust.profileCI(0, Hill)
+    expect ValueError:
+      discard robust.ec50ProfileCI(0)
+    expect ValueError:
+      discard parallel.profileCI(3, Hill)
+    expect ValueError:
+      discard parallel.ecxProfileCI(0, 100.0)

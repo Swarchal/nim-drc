@@ -119,12 +119,14 @@ proc bootstrap*(
   ##
   ## Residual resampling assumes the model and the weights are right; case
   ## resampling does not, but needs more data, since a resample can miss
-  ## doses. Not available for the curves of a joint fit (bootstrap the
-  ## `MultiFit` instead).
+  ## doses. Not available for the curves of a joint fit: bootstrap the
+  ## `MultiFit` instead, and take the curve's view in each replicate.
   checkReplicates(n)
   if fit.jointView:
     raise newException(
-      ValueError, "for a curve of a joint fit, bootstrap the joint fit instead"
+      ValueError,
+      "for a curve of a joint fit, bootstrap the joint fit and use " &
+        "`f.curves[c]` in the statistic",
     )
   result.fit = fit
   result.resample = resample
@@ -165,9 +167,16 @@ proc bootstrap*(
   ## .. code-block:: nim
   ##   let boot = parallel.bootstrap()
   ##   echo boot.bootCI(proc(f: MultiFit): float = f.relativePotency(1, 0).ratio)
+  ##
+  ## For a statistic of one curve, use its view in each replicate, e.g.
+  ## `boot.bootCI(proc(f: MultiFit): float = f.curves[2].ec50)`.
   checkReplicates(n)
   result.fit = fit
   result.resample = resample
+  var refitOpts = opts
+  refitOpts.loss = fit.loss
+  if fit.loss != Squared:
+    refitOpts.tuning = fit.tuning
   let
     (fixed, bounds) =
       refitArgs(fit.model, fit.fixed, fit.fixedValues.toParams, fit.lower, fit.upper)
@@ -188,10 +197,11 @@ proc bootstrap*(
     fit.n,
     fit.df,
     proc(d, y, w: seq[float], curve: seq[int]): MultiFit =
-      result =
-        fitMultiFrom(model, d, y, curve, shared, w, fixed, bounds, opts, start, true)
+      result = fitMultiFrom(
+        model, d, y, curve, shared, w, fixed, bounds, refitOpts, start, true
+      )
       if not result.converged:
-        result = fitMulti(model, d, y, curve, shared, w, fixed, bounds, opts)
+        result = fitMulti(model, d, y, curve, shared, w, fixed, bounds, refitOpts)
     ,
   )
 

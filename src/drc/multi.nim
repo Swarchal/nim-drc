@@ -20,13 +20,25 @@ type MultiFit* = object
   n*: int ## observations with non-zero weight
   df*: int ## n − number of free joint parameters
   ssr*: float
-  sigma*: float ## pooled residual standard error, sqrt(ssr / df)
+  sigma*: float
+    ## pooled residual standard error, sqrt(ssr / df); for a robust fit, the
+    ## robust (MAD) scale of all the residuals
   rSquared*: float
-  logLik*: float ## Gaussian log-likelihood, as R's logLik.nls
-  aic*: float
-  bic*: float
+  logLik*: float ## Gaussian log-likelihood, as R's logLik.nls (NaN for robust fits)
+  aic*: float ## (NaN for robust fits)
+  bic*: float ## (NaN for robust fits)
+  loss*: Loss
+  tuning*: float ## the loss's tuning constant (robust fits)
+  robustWeights*: seq[float]
+    ## final ψ(u)/u per observation, in the order given (robust fits; 0
+    ## where the user's weight is 0)
   converged*: bool
-  iterations*: int ## iterations of the Levenberg–Marquardt run that won
+    ## false if the optimiser or, for a robust fit, the reweighting did not
+    ## converge (see `warnings`)
+  usedFallback*: bool ## Levenberg–Marquardt failed and Nelder–Mead was run
+  fallbackConverged*: bool
+    ## with `usedFallback`: Nelder–Mead or its polishing run converged
+  iterations*: int ## iterations of the final Levenberg–Marquardt run
   status*: LMStatus
   warnings*: set[FitWarning] ## includes fwEc50OutsideRange if any curve has it
   slots: seq[array[DrcParam, int]]
@@ -105,8 +117,6 @@ proc fitMultiFrom(
   ## `fitMulti`, or with `warm`, one Levenberg–Marquardt run from the joint
   ## vector `start` in place of the starting-value search; for refits of data
   ## close to an earlier fit's.
-  if opts.loss != Squared:
-    raise newException(ValueError, "robust losses are not supported for joint fits")
   if doses.len != responses.len or curve.len != doses.len:
     raise newException(ValueError, "doses, responses and curve differ in length")
   if weights.len != 0 and weights.len != doses.len:
@@ -124,6 +134,8 @@ proc fitMultiFrom(
     result.upper[param] = box.upper[ord(param)]
   result.fixedValues = fixedValues
   result.curveIds = @curve
+  result.loss = opts.loss
+  result.tuning = resolveTuning(opts)
 
   var m = 0
   for c in curve:
@@ -207,14 +219,18 @@ proc fitMultiFrom(
       if k == 0 or r.better(result):
         result = r
 
-  var best: LMDynResult
+  var
+    best: LMDynResult
+    firstStart: seq[float] # for the fallback, if no fit has a finite SSR
   if warm:
+    firstStart = start
     best = search(@[start], result.jointFree)
   else:
     # Starting values: each curve fitted on its own where it has enough data,
     # with shared parameters started at the typical value over curves.
     var singleOpts = opts
     singleOpts.fallback = false
+    singleOpts.loss = Squared # a robust fit reweights from the least-squares one
     let curveFree = drcParamCount - card(fixedParams)
     var single = newSeq[ParamVec](m)
     for c in 0 ..< m:
@@ -249,6 +265,7 @@ proc fitMultiFrom(
       else:
         for c in 0 ..< m:
           startA[result.slots[c][param]] = single[c][ord(param)]
+    firstStart = startA
     var starts = @[startA]
     if shared - fixedParams != {} and result.n >= max(curveFree, 1):
       # The pooled curve is a good guess for the shared parameters.
@@ -297,12 +314,51 @@ proc fitMultiFrom(
     else:
       best = search(starts, result.jointFree)
 
+  result.converged = best.status.converged
+  if opts.fallback and not result.converged:
+    # As for one curve: Nelder–Mead, then Levenberg–Marquardt to polish.
+    let nm = nelderMead(
+      proc(p: seq[float]): float =
+        weightedSsr(joint, obs, ys, w, p),
+      if best.ssr.isFinite: best.params else: firstStart,
+      result.jointFree,
+      lower,
+      upper,
+      opts.nelderMead,
+    )
+    best = levenbergMarquardt(
+      joint, obs, ys, w, nm.params, result.jointFree, lower, upper, opts.lm
+    )
+    result.usedFallback = true
+    result.fallbackConverged = best.status.converged or nm.converged
+    result.converged = result.fallbackConverged
+
+  let meanY = sumWY / sumW
+  var sst = 0.0
+  for i in 0 ..< doses.len:
+    sst += w[i] * (responses[i] - meanY) ^ 2
+
+  # A robust fit reweights from the least-squares fit, as for one curve.
+  var
+    robust: IrlsResult[LMDynResult]
+    u: seq[float] # residuals in units of the robust scale
+  if result.loss != Squared:
+    robust = robustFit(
+      joint, obs, ys, w, best, result.jointFree, lower, upper, result.loss,
+      result.tuning, sst, result.n, opts,
+    )
+    best = robust.fit
+    result.converged = best.status.converged
+    if not robust.converged:
+      result.warnings.incl fwRobustNotConverged
+    (u, result.robustWeights) = robust.robustUnits(w, result.loss, result.tuning)
+
   result.joint = best.params
   result.iterations = best.iterations
   result.status = best.status
-  result.converged = best.status.converged
   if not result.converged:
     result.warnings.incl fwNotConverged
+  result.converged = result.warnings * {fwNotConverged, fwRobustNotConverged} == {}
   for c in 0 ..< m:
     for param in DrcParam:
       let slot = result.slots[c][param]
@@ -322,28 +378,35 @@ proc fitMultiFrom(
   result.df = result.n - nFree
   if result.df == 0:
     result.warnings.incl fwNoResidualDf
-  result.sigma =
-    if result.df > 0:
-      sqrt(result.ssr / float(result.df))
-    else:
-      NaN
+  var varianceScale: float
+  if result.loss == Squared:
+    result.sigma =
+      if result.df > 0:
+        sqrt(result.ssr / float(result.df))
+      else:
+        NaN
+    varianceScale = result.sigma ^ 2
+  else:
+    result.sigma = robust.scale
+    varianceScale = robustVarianceScale(
+      result.loss, result.tuning, u, w, robust.scale, nFree, result.n, result.df
+    )
   let np = result.joint.len
   result.jointCov = newSeq[seq[float]](np)
   for i in 0 ..< np:
     result.jointCov[i] = newSeq[float](np)
     for j in 0 ..< np:
       if result.jointFree[i] and result.jointFree[j]:
-        result.jointCov[i][j] = result.sigma ^ 2 * unscaled[i][j]
+        result.jointCov[i][j] = varianceScale * unscaled[i][j]
 
-  let meanY = sumWY / sumW
-  var sst = 0.0
-  for i in 0 ..< doses.len:
-    sst += w[i] * (responses[i] - meanY) ^ 2
   result.rSquared = 1.0 - result.ssr / sst
-  result.logLik = gaussianLogLik(result.ssr, result.n, sumLogW)
-  let k = float(nFree + 1) # free parameters plus σ
-  result.aic = -2.0 * result.logLik + 2.0 * k
-  result.bic = -2.0 * result.logLik + ln(float(result.n)) * k
+  if result.loss == Squared:
+    result.logLik = gaussianLogLik(result.ssr, result.n, sumLogW)
+    let k = float(nFree + 1) # free parameters plus σ
+    result.aic = -2.0 * result.logLik + 2.0 * k
+    result.bic = -2.0 * result.logLik + ln(float(result.n)) * k
+  else:
+    (result.logLik, result.aic, result.bic) = (NaN, NaN, NaN)
 
   # Each curve as a DrcFit: its parameters and covariance block, with the
   # joint σ and df so intervals and bands account for the pooled fit.
@@ -352,7 +415,12 @@ proc fitMultiFrom(
     v.model = model
     v.fixed = fixedParams
     (v.lower, v.upper) = (result.lower, result.upper)
-    v.loss = Squared
+    v.loss = result.loss
+    v.tuning = result.tuning
+    if result.loss != Squared:
+      for i in 0 ..< doses.len:
+        if curve[i] == c:
+          v.robustWeights.add result.robustWeights[i]
     for param in DrcParam:
       v.params[param] = result.joint[result.slots[c][param]]
       for other in DrcParam:
@@ -390,6 +458,8 @@ proc fitMultiFrom(
       else:
         (NaN, NaN)
     v.converged = result.converged
+    v.usedFallback = result.usedFallback
+    v.fallbackConverged = result.fallbackConverged
     v.iterations = result.iterations
     v.status = result.status
     v.warnings = result.warnings - {fwAtBound}
@@ -426,8 +496,10 @@ proc fitMulti*(
   ## and the bands work on it. Its covariance is curve c's block of the joint
   ## covariance, and its `df` and `sigma` are the joint fit's; its `ssr`,
   ## `rSquared` and `n` are its own. `param` and `cov` give the joint
-  ## estimates, including covariances between curves. Only least squares is
-  ## supported.
+  ## estimates, including covariances between curves.
+  ##
+  ## As for `fitCurve`, `opts.loss` = Huber or Tukey gives a robust fit, and
+  ## Nelder–Mead takes over if Levenberg–Marquardt does not converge.
   fitMultiFrom(
     model, doses, responses, curve, shared, weights, fixed, bounds, opts, @[], false
   )
@@ -527,6 +599,89 @@ proc slotBounds(fit: MultiFit): tuple[lower, upper: seq[float]] =
       result.lower[slots[param]] = fit.lower[param]
       result.upper[slots[param]] = fit.upper[param]
 
+proc checkProfile(fit: MultiFit) =
+  if fit.loss != Squared:
+    raise
+      newException(ValueError, "profile-likelihood intervals need a least-squares fit")
+
+proc profileModel(
+    fit: MultiFit
+): tuple[
+  model: proc(i: float, p: seq[float], grad: var seq[float]): float,
+  obs, lower, upper: seq[float],
+] =
+  ## The joint model, its x (the observation index) and the bounds on each slot.
+  result.model = jointModel(logDoses(fit.data.doses), fit.slots, fit.curveIds)
+  result.obs = observationIndex(fit.data.doses.len)
+  (result.lower, result.upper) = fit.slotBounds
+
+proc profileCI*(
+    fit: MultiFit, curve: int, param: DrcParam, level = 0.95, opts = FitOptions()
+): ConfInt =
+  ## Profile-likelihood confidence interval for curve `curve`'s `param`, as
+  ## `profileCI` for a single fit, refitting the whole joint model (a shared
+  ## parameter has the same interval for every curve). Least-squares fits
+  ## only.
+  fit.checkCurve(curve)
+  fit.checkProfile
+  let tq = fit.curves[curve].tQuantile(level)
+  let slot = fit.slots[curve][param]
+  if not fit.jointFree[slot]:
+    return (fit.joint[slot], fit.joint[slot])
+  let (model, obs, lower, upper) = fit.profileModel
+  profileInterval(
+    pinnedTau(
+      model, obs, fit.data.responses, fit.data.weights, slot, fit.jointFree, lower,
+      upper, fit.ssr, fit.sigma, opts.lm,
+    ),
+    fit.joint,
+    fit.joint[slot],
+    lower[slot],
+    upper[slot],
+    fit.sigma,
+    tq,
+    sqrt(fit.jointCov[slot][slot]),
+    param == Asymmetry,
+  )
+
+proc ecxProfileCI*(
+    fit: MultiFit, curve: int, pct: float, level = 0.95, opts = FitOptions()
+): ConfInt =
+  ## Profile-likelihood confidence interval for curve `curve`'s `ecx`, as
+  ## `ecxProfileCI` for a single fit: each refit of the joint model is
+  ## constrained to the curve's log10(ECx). This works whether LogEC50 is
+  ## separate, shared, fixed or bounded. If ECx depends on no free
+  ## parameter, the interval is the estimate. Least-squares fits only.
+  checkPercent(pct)
+  fit.checkCurve(curve)
+  fit.checkProfile
+  let view = fit.curves[curve]
+  let tq = view.tQuantile(level)
+  let (_, grad) = view.logEcxAndGradient(pct)
+  let (model, obs, lower, upper) = fit.profileModel
+  let ci = constrainedInterval(
+    model,
+    logEcxConstraint[seq[float]](fit.slots[curve], fractionAt(view.params[Hill], pct)),
+    obs,
+    fit.data.responses,
+    fit.data.weights,
+    fit.joint,
+    fit.jointFree,
+    lower,
+    upper,
+    fit.ssr,
+    fit.sigma,
+    tq,
+    sqrt(view.deltaVariance(grad, LogEC50 .. Asymmetry)),
+    opts.lm,
+  )
+  (pow(10.0, ci.lower), pow(10.0, ci.upper))
+
+proc ec50ProfileCI*(
+    fit: MultiFit, curve: int, level = 0.95, opts = FitOptions()
+): ConfInt =
+  fit.ecxProfileCI(curve, 50.0, level, opts)
+
 proc relativePotencyProfileCI*(
     fit: MultiFit, a, b: int, pct = 50.0, level = 0.95, opts = FitOptions()
 ): ConfInt =
@@ -535,20 +690,44 @@ proc relativePotencyProfileCI*(
   ## log10(ECx(a)/ECx(b)) in place of the two curves' LogEC50s, and the log
   ## ratio is profiled as in `profileCI`, then back-transformed. An end is 0
   ## or Inf if the data do not bound the ratio within 10·t standard errors.
-  ## Needs LogEC50 to be fitted separately for each curve: not shared, fixed
-  ## or bounded. `opts.lm` controls the refits.
+  ## If LogEC50 is shared, fixed or bounded, each refit is instead
+  ## constrained to the log ratio. If the ratio depends on no free parameter
+  ## (the EC50s of 4PL curves that share LogEC50), the interval is the
+  ## estimate. Least-squares fits only. `opts.lm` controls the refits.
   if a == b:
     raise newException(ValueError, "the two curves must differ")
   let (center, variance) = fit.logPotency(a, b, pct)
   let tq = fit.curves[a].tQuantile(level)
-  if LogEC50 in fit.shared:
-    raise newException(
-      ValueError, "LogEC50 is shared or fixed, so the potency ratio cannot be profiled"
-    )
-  if fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
-    raise newException(
-      ValueError, "LogEC50 is bounded, so the potency ratio cannot be profiled"
-    )
+  fit.checkProfile
+  if LogEC50 in fit.shared or fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
+    let
+      ga =
+        logEcxConstraint[seq[float]](fit.slots[a], fractionAt(fit.param(a, Hill), pct))
+      gb =
+        logEcxConstraint[seq[float]](fit.slots[b], fractionAt(fit.param(b, Hill), pct))
+      ratio = proc(q: seq[float], grad: var seq[float]): float =
+        var gradB = newSeq[float](q.len)
+        result = ga(q, grad) - gb(q, gradB)
+        for i in 0 ..< q.len:
+          grad[i] -= gradB[i]
+      (model, obs, lower, upper) = fit.profileModel
+      ci = constrainedInterval(
+        model,
+        ratio,
+        obs,
+        fit.data.responses,
+        fit.data.weights,
+        fit.joint,
+        fit.jointFree,
+        lower,
+        upper,
+        fit.ssr,
+        fit.sigma,
+        tq,
+        sqrt(variance),
+        opts.lm,
+      )
+    return (pow(10.0, ci.lower), pow(10.0, ci.upper))
 
   # q is the joint vector with q[sb] = log10 ECx(b) and q[sa] = the log ratio,
   # so LogEC50(b) = q[sb] + z_b/Hill_b and LogEC50(a) = q[sa] + q[sb] + z_a/Hill_a
@@ -611,21 +790,26 @@ proc relativePotencyProfileCI*(
   q[sa] = center
   let (lower, upper) = fit.slotBounds
   let ci = profileInterval(
-    model,
-    observationIndex(x.len),
-    fit.data.responses,
-    fit.data.weights,
+    pinnedTau(
+      model,
+      observationIndex(x.len),
+      fit.data.responses,
+      fit.data.weights,
+      sa,
+      fit.jointFree,
+      lower,
+      upper,
+      fit.ssr,
+      fit.sigma,
+      opts.lm,
+    ),
     q,
-    sa,
-    fit.jointFree,
-    lower,
-    upper,
-    fit.ssr,
+    center,
+    -Inf,
+    Inf,
     fit.sigma,
     tq,
     sqrt(variance),
-    false,
-    opts.lm,
   )
   (pow(10.0, ci.lower), pow(10.0, ci.upper))
 
@@ -633,6 +817,9 @@ proc fTest*(reduced, full: MultiFit): FTest =
   ## F test of a reduced joint fit (e.g. parallel curves) against a fuller one
   ## (e.g. separate curves) on the same data, as R's `anova` for nested
   ## models. A small p means the extra parameters improve the fit.
+  ## Least-squares fits only.
+  if reduced.loss != Squared or full.loss != Squared:
+    raise newException(ValueError, "an F test needs least-squares fits")
   if reduced.dataHash != full.dataHash:
     raise newException(ValueError, "the fits are not to the same data")
   if reduced.curveIds == full.curveIds:
@@ -659,6 +846,9 @@ proc lackOfFit*(fit: MultiFit): FTest =
   ## Lack-of-fit F test of the joint fit against one free mean per dose of
   ## each curve, as `lackOfFit` for a single fit. A small p for parallel
   ## curves that `fTest` does not reject still means some curve is misfitted.
+  ## Least-squares fits only.
+  if fit.loss != Squared:
+    raise newException(ValueError, "a lack-of-fit test needs a least-squares fit")
   var pe: tuple[ss: float, groups: int]
   for curve in fit.curves:
     let p = pureError(curve.doses, curve.responses, curve.weights)
@@ -671,6 +861,8 @@ proc summary*(fit: MultiFit, level = 0.95): string =
   let pct = &"{100.0 * level:g}%"
   let tq = fit.curves[0].tQuantile(level) # every curve has the joint df
   result.add &"{fit.model} joint fit to {fit.n} observations in {fit.curves.len} curves"
+  if fit.loss != Squared:
+    result.add &", robust ({fit.loss}, tuning {fit.tuning:g})"
   var sharedNames: seq[string]
   for param in fit.shared - fit.fixed:
     sharedNames.add $param
@@ -703,8 +895,15 @@ proc summary*(fit: MultiFit, level = 0.95): string =
     let ci = curve.ecxInterval(50.0, tq)
     result.add &"""{"EC50[" & $c & "]":<12}{curve.ec50:>12.6g}{"":>12}{ci.lower:>14.6g}{ci.upper:>14.6g}""" &
       "\n"
-  result.add &"\nResidual standard error: {fit.sigma:.6g} on {fit.df} degrees of freedom\n"
-  result.add &"R²: {fit.rSquared:.6g}   AIC: {fit.aic:.6g}   BIC: {fit.bic:.6g}\n"
-  result.add &"Stopped after {fit.iterations} iterations: {fit.status}"
+  if fit.loss == Squared:
+    result.add &"\nResidual standard error: {fit.sigma:.6g} on {fit.df} degrees of freedom\n"
+    result.add &"R²: {fit.rSquared:.6g}   AIC: {fit.aic:.6g}   BIC: {fit.bic:.6g}\n"
+  else:
+    result.add &"\nRobust residual scale (MAD): {fit.sigma:.6g} on {fit.df} degrees of freedom\n"
+    result.add robustWeightNote(fit.robustWeights, fit.n) & "\n"
+    result.add &"R²: {fit.rSquared:.6g}\n"
+  result.add fallbackNote(
+    fit.loss, fit.usedFallback, fit.fallbackConverged, fit.status, fit.iterations
+  )
   for warning in fit.warnings:
     result.add &"\nWarning: {warning}"

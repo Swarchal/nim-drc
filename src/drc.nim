@@ -431,67 +431,124 @@ proc lackOfFit*(fit: DrcFit): FTest =
     fit.ssr, fit.df, fit.n, pureError(fit.doses, fit.responses, fit.weights)
   )
 
-proc profileTau[F, V, B](
-    fn: F,
-    x, y, w: openArray[float],
-    j: int,
-    beta: float,
-    start: V,
-    pinned: B,
-    lower, upper: V,
-    ssrHat, sigma: float,
-    lm: LMOptions,
-    params: var V,
-): float =
-  ## The profile t statistic τ(β) = sqrt(S(β) − Ŝ)/σ, where S(β) is the SSR
-  ## refitted from `start` with parameter j held at β; `params` gets the refit.
-  ## Inf if the refit has no finite SSR.
-  var p = start
-  p[j] = beta
-  let r = levenbergMarquardt(fn, x, y, w, p, pinned, lower, upper, lm)
-  params = r.params
-  if r.ssr.isNaN:
+type ProfileTau[V] = proc(beta: float, start: V, params: var V): float
+  ## τ(β) = sqrt(S(β) − Ŝ)/σ, where S(β) is the SSR refitted from `start`
+  ## with the profiled quantity held at β; `params` gets the refit. Inf where
+  ## there is no such fit.
+
+proc profileTauOf(s, ssrHat, sigma: float): float =
+  if s.isNaN:
     Inf
   else:
-    sqrt(max(r.ssr - ssrHat, 0.0)) / sigma
+    sqrt(max(s - ssrHat, 0.0)) / sigma
 
-proc profileEnd[F, V, B](
+proc pinnedTau[F, V, B](
     fn: F,
-    x, y, w: openArray[float],
-    pHat: V,
+    x, y, w: seq[float],
     j: int,
     free: B,
     lower, upper: V,
-    ssrHat, sigma, tq, step, direction: float,
-    positive: bool,
+    ssrHat, sigma: float,
     lm: LMOptions,
-): float =
-  ## One end of a profile-likelihood interval: the value β of parameter j,
-  ## beyond pHat[j] in `direction` (±1), at which τ(β) reaches `tq`. It steps
-  ## outwards from pHat[j] (by `step`, growing 1.5× each time) until τ passes
-  ## `tq`, then finds the crossing by the Illinois method. Each refit starts
-  ## from the nearest point inside the crossing, so the profile follows one
-  ## valley. If τ stays below `tq` up to a bound, the bound is the end (0 for
-  ## a `positive` parameter, i.e. Asymmetry, which is approached but never
-  ## evaluated). As R's `profile.nls`, the profile is followed only to
-  ## 10·`tq` steps from the estimate: far out, the refits are poorly
-  ## conditioned (on a partial curve, a plateau runs off to infinity) and can
-  ## stop short of the minimum, which would look like a crossing. If τ has
-  ## not reached `tq` by then, the data are taken not to bound the parameter,
-  ## and the end is the bound (±Inf if none) without a refit there.
+): ProfileTau[V] =
+  ## τ for parameter j: each refit holds it at β.
   var pinned = free
   pinned[j] = false
-  let open = positive and direction < 0.0 and not (lower[j] > 0.0)
+  result = proc(beta: float, start: V, params: var V): float =
+    var p = start
+    p[j] = beta
+    let r = levenbergMarquardt(fn, x, y, w, p, pinned, lower, upper, lm)
+    params = r.params
+    profileTauOf(r.ssr, ssrHat, sigma)
+
+proc constrainedTau[F, G, V, B](
+    fn: F,
+    g: G,
+    x, y, w: seq[float],
+    free: B,
+    lower, upper: V,
+    ssrHat, sigma, scale: float,
+    lm: LMOptions,
+): ProfileTau[V] =
+  ## τ for a function g(p) of the parameters (`g(p, grad)` returns it and
+  ## writes its gradient), with standard error about `scale`: each refit
+  ## minimises the SSR subject to g(p) = β, within the bounds. The constraint
+  ## is imposed by the augmented Lagrangian method, as one extra observation
+  ## (x = NaN) with response β − λ/μ, value g(p) and weight μ, refitting by
+  ## Levenberg–Marquardt and updating λ ← λ + μ·(g − β) until g = β. μ makes
+  ## the extra term ~1000× as curved as the SSR along g, so each round cuts
+  ## the violation ~1000-fold. Inf if no fit within the bounds has g = β.
+  let
+    mu = 1e3 * (sigma / scale) ^ 2
+    exact = 1e-10 * scale # stop here
+    feasible = 1e-6 * scale # accept up to here (Levenberg–Marquardt's own precision)
+  var xa = x
+  xa.add NaN
+  var wa = w
+  wa.add mu
+  let augmented = proc(xi: float, p: V, grad: var V): float =
+    if xi.isNaN:
+      g(p, grad)
+    else:
+      fn(xi, p, grad)
+  result = proc(beta: float, start: V, params: var V): float =
+    var
+      ya = y
+      p = start
+      lambda = 0.0
+      violation = Inf
+      grad: V
+    ya.add 0.0
+    grad.ensureLen p.len
+    for _ in 0 ..< 30:
+      ya[^1] = beta - lambda / mu
+      p = levenbergMarquardt(augmented, xa, ya, wa, p, free, lower, upper, lm).params
+      let v = g(p, grad) - beta
+      if not v.isFinite:
+        return Inf
+      let previous = violation
+      violation = v
+      lambda += mu * v
+      if abs(v) <= exact or (abs(v) <= feasible and abs(v) > 0.1 * abs(previous)):
+        break # converged, or at the limit of the refits' precision
+    if not (abs(violation) <= feasible):
+      return Inf
+    params = p
+    # S at g = β exactly, to first order: the profile's slope is −2λ.
+    let s = weightedSsr(fn, x, y, w, p) + 2.0 * lambda * violation
+    profileTauOf(s, ssrHat, sigma)
+
+proc profileEnd[V](
+    tau: ProfileTau[V],
+    pHat: V,
+    center, lower, upper, tq, step, direction: float,
+    positive: bool,
+): float =
+  ## One end of a profile-likelihood interval: the value β, beyond `center`
+  ## (the estimate) in `direction` (±1), at which τ(β) reaches `tq`. It steps
+  ## outwards from `center` (by `step`, growing 1.5× each time) until τ passes
+  ## `tq`, then finds the crossing by the Illinois method. Each refit starts
+  ## from the nearest point inside the crossing (`pHat` at first), so the
+  ## profile follows one valley. If τ stays below `tq` up to `lower` or
+  ## `upper`, that bound is the end (0 for a `positive` quantity, i.e.
+  ## Asymmetry, which is approached but never evaluated). As R's
+  ## `profile.nls`, the profile is followed only to 10·`tq` steps from the
+  ## estimate: far out, the refits are poorly conditioned (on a partial
+  ## curve, a plateau runs off to infinity) and can stop short of the
+  ## minimum, which would look like a crossing. If τ has not reached `tq` by
+  ## then, the data are taken not to bound the quantity, and the end is the
+  ## bound (±Inf if none) without a refit there.
+  let open = positive and direction < 0.0 and not (lower > 0.0)
   let limit =
     if direction > 0.0:
-      upper[j]
+      upper
     elif open:
       0.0
     else:
-      lower[j]
+      lower
   let reach = 10.0 * tq * step
   var
-    inner = pHat[j]
+    inner = center
     innerP = pHat
     innerTau = 0.0
     outer, outerTau: float
@@ -506,11 +563,9 @@ proc profileEnd[F, V, B](
         beta = 0.5 * (inner + limit) # approach 0 without reaching it
       else:
         (beta, atLimit) = (limit, true)
-    if abs(beta - pHat[j]) > reach:
+    if abs(beta - center) > reach:
       return limit
-    let t = profileTau(
-      fn, x, y, w, j, beta, innerP, pinned, lower, upper, ssrHat, sigma, lm, p
-    )
+    let t = tau(beta, innerP, p)
     if t >= tq:
       (outer, outerTau, found) = (beta, t, true)
       break
@@ -531,9 +586,7 @@ proc profileEnd[F, V, B](
     var c = (a * gb - b * ga) / (gb - ga)
     if not (c > min(a, b) and c < max(a, b)):
       c = 0.5 * (a + b) # e.g. gb = Inf
-    let gc =
-      profileTau(fn, x, y, w, j, c, innerP, pinned, lower, upper, ssrHat, sigma, lm, p) -
-      tq
+    let gc = tau(c, innerP, p) - tq
     if gc == 0.0:
       return c
     if gc < 0.0:
@@ -548,32 +601,29 @@ proc profileEnd[F, V, B](
       side = 1
   0.5 * (a + b)
 
-proc profileInterval[F, V, B](
-    fn: F,
-    x, y, w: openArray[float],
+func profileStep(se, center: float): float =
+  ## The first step out from the estimate: its standard error `se`, or
+  ## 0.1·max(|estimate|, 1) if that is unusable.
+  if se > 0.0 and se < Inf:
+    se
+  else:
+    0.1 * max(abs(center), 1.0)
+
+proc profileInterval[V](
+    tau: ProfileTau[V],
     pHat: V,
-    j: int,
-    free: B,
-    lower, upper: V,
-    ssrHat, sigma, tq, se: float,
-    positive: bool,
-    lm: LMOptions,
+    center, lower, upper, sigma, tq, se: float,
+    positive = false,
 ): ConfInt =
-  ## Both ends of the profile-likelihood interval for parameter j (see
-  ## `profileEnd`), stepping out by its standard error `se`, or by
-  ## 0.1·max(|estimate|, 1) if that is unusable. NaN without a usable σ.
+  ## Both ends of the profile-likelihood interval (see `profileEnd`) of a
+  ## quantity estimated at `center`, with standard error `se`, within
+  ## `lower` .. `upper`. NaN without a usable σ.
   if not (sigma > 0.0 and sigma < Inf):
     return (NaN, NaN)
-  let step =
-    if se > 0.0 and se < Inf:
-      se
-    else:
-      0.1 * max(abs(pHat[j]), 1.0)
+  let step = profileStep(se, center)
   for k, direction in [-1.0, 1.0]:
-    let bound = profileEnd(
-      fn, x, y, w, pHat, j, free, lower, upper, ssrHat, sigma, tq, step, direction,
-      positive, lm,
-    )
+    let bound =
+      profileEnd(tau, pHat, center, lower, upper, tq, step, direction, positive)
     if k == 0:
       result.lower = bound
     else:
@@ -586,7 +636,8 @@ proc checkProfile(fit: DrcFit) =
   if fit.jointView:
     raise newException(
       ValueError,
-      "profile-likelihood intervals are not available for curves of a joint fit",
+      "for a curve of a joint fit, use the MultiFit overloads " &
+        "(e.g. `profileCI(fit, curve, param)`)",
     )
 
 proc profileData(
@@ -610,45 +661,108 @@ proc profileCI*(
   ## parameter within 10·t standard errors of the estimate (where R gives
   ## NA). A fixed parameter's interval is its value; NaN without residual
   ## degrees of freedom. `opts.lm` controls the refits. Least-squares fits
-  ## only, and not for the curves of a joint fit.
+  ## only; for the curves of a joint fit, use `profileCI(MultiFit, …)`.
   fit.checkProfile
   let tq = fit.tQuantile(level)
   if param in fit.fixed:
     return (fit.params[param], fit.params[param])
   let (x, free, box) = fit.profileData
+  let j = ord(param)
   profileInterval(
-    ll5,
-    x,
-    fit.responses,
-    fit.weights,
+    pinnedTau(
+      ll5, x, fit.responses, fit.weights, j, free, box.lower, box.upper, fit.ssr,
+      fit.sigma, opts.lm,
+    ),
     fit.params.toVec,
-    ord(param),
-    free,
-    box.lower,
-    box.upper,
-    fit.ssr,
+    fit.params[param],
+    box.lower[j],
+    box.upper[j],
     fit.sigma,
     tq,
     fit.se[param],
     param == Asymmetry,
-    opts.lm,
   )
+
+proc logEcxConstraint[V](
+    slots: array[DrcParam, int], r: float
+): proc(p: V, grad: var V): float =
+  ## g(p) = the log10 dose at which the curve whose parameters are at `slots`
+  ## of p is the fraction r = sᴬ of the way from Bottom to Top (see
+  ## `zOffset`), with its gradient.
+  result = proc(p: V, grad: var V): float =
+    let
+      h = p[slots[Hill]]
+      (z, _, dzda) = zOffset(r, p[slots[Asymmetry]])
+    grad.setZero()
+    grad[slots[LogEC50]] += 1.0
+    grad[slots[Hill]] += z / (h * h)
+    grad[slots[Asymmetry]] -= dzda / h
+    p[slots[LogEC50]] - z / h
+
+proc constrainedInterval[F, G, V, B](
+    fn: F,
+    g: G,
+    x, y, w: seq[float],
+    pHat: V,
+    free: B,
+    lower, upper: V,
+    ssrHat, sigma, tq, se: float,
+    lm: LMOptions,
+): ConfInt =
+  ## The profile-likelihood interval for g(p) (see `constrainedTau`), or the
+  ## point g(p̂) if g does not depend on any free parameter.
+  var grad: V
+  grad.ensureLen pHat.len
+  let center = g(pHat, grad)
+  var depends = false
+  for j in 0 ..< pHat.len:
+    depends = depends or (free[j] and grad[j] != 0.0)
+  if not depends:
+    return (center, center)
+  if not (sigma > 0.0 and sigma < Inf):
+    return (NaN, NaN)
+  let tau = constrainedTau(
+    fn, g, x, y, w, free, lower, upper, ssrHat, sigma, profileStep(se, center), lm
+  )
+  profileInterval(tau, pHat, center, -Inf, Inf, sigma, tq, se)
 
 proc ecxProfileCI*(
     fit: DrcFit, pct: float, level = 0.95, opts = FitOptions()
 ): ConfInt =
-  ## Profile-likelihood confidence interval for `ecx`: the model is
-  ## reparametrised with log10(ECx) in place of LogEC50, and that is profiled
-  ## as in `profileCI`, then back-transformed. An unbounded end is 0 or Inf.
-  ## Not available when LogEC50 is fixed or bounded.
+  ## Profile-likelihood confidence interval for `ecx`: log10(ECx) is
+  ## profiled as in `profileCI`, then back-transformed. An unbounded end is 0
+  ## or Inf. The model is reparametrised with log10(ECx) in place of LogEC50
+  ## or, if LogEC50 is fixed or bounded, each refit is constrained to the
+  ## ECx. If ECx depends on no free parameter (the EC50 of a 4PL with
+  ## LogEC50 fixed), the interval is the estimate.
   checkPercent(pct)
   fit.checkProfile
   let tq = fit.tQuantile(level)
-  if LogEC50 in fit.fixed:
-    raise newException(ValueError, "LogEC50 is fixed, so ECx cannot be profiled")
-  if fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
-    raise newException(ValueError, "LogEC50 is bounded, so ECx cannot be profiled")
   let r = fractionAt(fit.params[Hill], pct)
+  let (x, free, box) = fit.profileData
+  let (logEcx, grad) = fit.logEcxAndGradient(pct)
+  let se = sqrt(fit.deltaVariance(grad, LogEC50 .. Asymmetry))
+  if LogEC50 in fit.fixed or fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
+    var slots: array[DrcParam, int]
+    for param in DrcParam:
+      slots[param] = ord(param)
+    let ci = constrainedInterval(
+      ll5,
+      logEcxConstraint[ParamVec](slots, r),
+      x,
+      fit.responses,
+      fit.weights,
+      fit.params.toVec,
+      free,
+      box.lower,
+      box.upper,
+      fit.ssr,
+      fit.sigma,
+      tq,
+      se,
+      opts.lm,
+    )
+    return (pow(10.0, ci.lower), pow(10.0, ci.upper))
   # q is the parameter vector with q[LogEC50] = log10(ECx), so
   # LogEC50 = log10(ECx) + z/Hill (see `zOffset`). z depends only on
   # Asymmetry, so it is kept between calls.
@@ -665,26 +779,21 @@ proc ecxProfileCI*(
     let dl = grad[ord(LogEC50)]
     grad[ord(Hill)] -= dl * z / (h * h)
     grad[ord(Asymmetry)] += dl * dzda / h
-  let (x, free, box) = fit.profileData
   var q = fit.params.toVec
-  let (logEcx, grad) = fit.logEcxAndGradient(pct)
   q[ord(LogEC50)] = logEcx
+  let j = ord(LogEC50)
   let ci = profileInterval(
-    model,
-    x,
-    fit.responses,
-    fit.weights,
+    pinnedTau(
+      model, x, fit.responses, fit.weights, j, free, box.lower, box.upper, fit.ssr,
+      fit.sigma, opts.lm,
+    ),
     q,
-    ord(LogEC50),
-    free,
-    box.lower,
-    box.upper,
-    fit.ssr,
+    logEcx,
+    -Inf,
+    Inf,
     fit.sigma,
     tq,
-    sqrt(fit.deltaVariance(grad, LogEC50 .. Asymmetry)),
-    false,
-    opts.lm,
+    se,
   )
   (pow(10.0, ci.lower), pow(10.0, ci.upper))
 
@@ -757,38 +866,40 @@ proc searchLM(
       if r.better(result):
         result = r
 
-proc standardisedResiduals(x, y, w: openArray[float], p: ParamVec): seq[float] =
+proc standardisedResiduals[F, V](fn: F, x, y, w: openArray[float], p: V): seq[float] =
   ## √wᵢ·(yᵢ − f(xᵢ)), and 0 for observations with zero weight.
   result = newSeq[float](x.len)
-  var grad: ParamVec
+  var grad: V
+  grad.ensureLen p.len
   for i in 0 ..< x.len:
     if w[i] > 0.0:
-      result[i] = sqrt(w[i]) * (y[i] - ll5(x[i], p, grad))
+      result[i] = sqrt(w[i]) * (y[i] - fn(x[i], p, grad))
 
-type IrlsResult = object
-  fit: LMResult[drcParamCount]
+type IrlsResult[R] = object
+  fit: R ## an `LMResult` (one curve) or `LMDynResult` (a joint fit)
   scale: float
   residuals: seq[float] ## standardised, at fit.params
   converged: bool
 
-proc irls(
+proc irls[F, V, B, R](
+    fn: F,
     x, y, w: openArray[float],
-    start: LMResult[drcParamCount],
-    free: array[drcParamCount, bool],
-    box: Box,
+    start: R,
+    free: B,
+    lower, upper: V,
     loss: Loss,
     c: float,
     scaleFloor: float,
     tol: float,
     opts: FitOptions,
-): IrlsResult =
+): IrlsResult[R] =
   ## M-estimation by iteratively reweighted least squares, as R's
   ## robustbase::nlrob. Each round takes the robust scale s of the current
   ## residuals (at least `scaleFloor`), weights observation i by wᵢ·ψ(uᵢ)/uᵢ
   ## with uᵢ = rᵢ/s, and refits. It stops when a converged refit changes the
   ## residuals by less than `tol` (relative).
   result.fit = start
-  result.residuals = standardisedResiduals(x, y, w, start.params)
+  result.residuals = standardisedResiduals(fn, x, y, w, start.params)
   var
     used: seq[float]
     robustW = newSeq[float](x.len)
@@ -807,11 +918,11 @@ proc irls(
     for i in 0 ..< x.len:
       robustW[i] = w[i] * psiWeight(loss, result.residuals[i] / result.scale, c)
     result.fit = levenbergMarquardt(
-      ll5, x, y, robustW, result.fit.params, free, box.lower, box.upper, opts.lm
+      fn, x, y, robustW, result.fit.params, free, lower, upper, opts.lm
     )
     if result.fit.status in {lmStalled, lmBadStart}:
       return # these weights cannot be fitted; unchanged residuals would look converged
-    let residuals = standardisedResiduals(x, y, w, result.fit.params)
+    let residuals = standardisedResiduals(fn, x, y, w, result.fit.params)
     var change, size = 0.0
     for i in 0 ..< x.len:
       change += (residuals[i] - result.residuals[i]) ^ 2
@@ -820,6 +931,100 @@ proc irls(
     if result.fit.status.converged and sqrt(change / max(size, 1e-20)) <= tol:
       result.converged = true
       return
+
+proc robustFit[F, V, B, R](
+    fn: F,
+    x, y, w: openArray[float],
+    best: R,
+    free: B,
+    lower, upper: V,
+    loss: Loss,
+    tuning, sst: float,
+    n: int,
+    opts: FitOptions,
+): IrlsResult[R] =
+  ## The robust fit by IRLS (`irls`) from the least-squares fit `best`. `sst`
+  ## is the responses' weighted total sum of squares over `n` observations.
+  # 1 ppm of the responses' (weighted RMS) spread: far below any real scatter.
+  let scaleFloor = 1e-6 * sqrt(sst / float(n))
+  var start = best
+  if loss == Tukey:
+    # Tukey's redescending ψ can stop in a local minimum, so start from Huber,
+    # converged only as far as nlrob's default tolerance.
+    start = irls(
+      fn,
+      x,
+      y,
+      w,
+      best,
+      free,
+      lower,
+      upper,
+      Huber,
+      defaultTuning(Huber),
+      scaleFloor,
+      max(opts.irlsTol, 1e-6),
+      opts,
+    ).fit
+  irls(
+    fn, x, y, w, start, free, lower, upper, loss, tuning, scaleFloor, opts.irlsTol, opts
+  )
+
+proc robustUnits[R](
+    r: IrlsResult[R], w: openArray[float], loss: Loss, tuning: float
+): tuple[u, weights: seq[float]] =
+  ## Each observation's residual in units of the robust scale, and its final
+  ## robust weight ψ(u)/u (0 where the user's weight is 0).
+  result.u = newSeq[float](w.len)
+  result.weights = newSeq[float](w.len)
+  for i in 0 ..< w.len:
+    if w[i] > 0.0:
+      if r.scale > 0.0:
+        result.u[i] = r.residuals[i] / r.scale
+      result.weights[i] = psiWeight(loss, result.u[i], tuning)
+
+proc robustVarianceScale(
+    loss: Loss, tuning: float, u, w: openArray[float], scale: float, nFree, n, df: int
+): float =
+  ## The factor that turns (JᵀWJ)⁻¹ into the covariance of a robust fit:
+  ## Huber's correction, as MASS::rlm, κ²·S / mean(ψ')², where
+  ## S = s²·Σψ(uᵢ)²/(n − p) and κ = 1 + p·var(ψ')/(n·mean(ψ')²). NaN without
+  ## residual degrees of freedom.
+  var
+    sumPsi2 = 0.0
+    derivative: RunningStat # of ψ'(uᵢ)
+  for i in 0 ..< u.len:
+    if w[i] > 0.0:
+      sumPsi2 += psi(loss, u[i], tuning) ^ 2
+      derivative.push(psiDerivative(loss, u[i], tuning))
+  let
+    meanD = derivative.mean
+    kappa = 1.0 + float(nFree) * derivative.varianceS / (float(n) * meanD * meanD)
+  if df > 0 and meanD > 0.0:
+    (kappa / meanD) ^ 2 * scale * scale * sumPsi2 / float(df)
+  else:
+    NaN
+
+proc resolveTuning(opts: FitOptions): float =
+  ## The robust loss's tuning constant (0 for least squares, as before a
+  ## robust fit sets it), after checking the robust options.
+  if opts.loss == Squared:
+    return 0.0
+  result =
+    if opts.tuning.isNaN:
+      defaultTuning(opts.loss)
+    else:
+      opts.tuning
+  if not (result > 0.0 and result < Inf):
+    raise newException(
+      ValueError, "tuning must be finite and positive, got " & $opts.tuning
+    )
+  if opts.irlsMaxIter < 1:
+    raise newException(
+      ValueError, "irlsMaxIter must be at least 1, got " & $opts.irlsMaxIter
+    )
+  if not (opts.irlsTol >= 0.0):
+    raise newException(ValueError, "irlsTol must be non-negative, got " & $opts.irlsTol)
 
 proc checkObservation(dose, response, weight: float) =
   checkDose(dose)
@@ -935,23 +1140,7 @@ proc fitCurveFrom(
     result.upper[param] = box.upper[ord(param)]
 
   result.loss = opts.loss
-  if opts.loss != Squared:
-    result.tuning =
-      if opts.tuning.isNaN:
-        defaultTuning(opts.loss)
-      else:
-        opts.tuning
-    if not (result.tuning > 0.0 and result.tuning < Inf):
-      raise newException(
-        ValueError, "tuning must be finite and positive, got " & $opts.tuning
-      )
-    if opts.irlsMaxIter < 1:
-      raise newException(
-        ValueError, "irlsMaxIter must be at least 1, got " & $opts.irlsMaxIter
-      )
-    if not (opts.irlsTol >= 0.0):
-      raise
-        newException(ValueError, "irlsTol must be non-negative, got " & $opts.irlsTol)
+  result.tuning = resolveTuning(opts)
 
   let nFree = drcParamCount - card(result.fixed)
   if result.n < max(nFree, 1):
@@ -1002,43 +1191,18 @@ proc fitCurveFrom(
 
   # A robust fit reweights from the least-squares fit.
   var
-    robustFit: IrlsResult
+    robust: IrlsResult[LMResult[drcParamCount]]
     u: seq[float] # residuals in units of the robust scale
   if result.loss != Squared:
-    # 1 ppm of the responses' (weighted RMS) spread: far below any real scatter.
-    let scaleFloor = 1e-6 * sqrt(sst / float(result.n))
-    var start = best
-    if result.loss == Tukey:
-      # Tukey's redescending ψ can stop in a local minimum, so start from Huber,
-      # converged only as far as nlrob's default tolerance.
-      start = irls(
-        x,
-        responses,
-        w,
-        best,
-        free,
-        box,
-        Huber,
-        defaultTuning(Huber),
-        scaleFloor,
-        max(opts.irlsTol, 1e-6),
-        opts,
-      ).fit
-    robustFit = irls(
-      x, responses, w, start, free, box, result.loss, result.tuning, scaleFloor,
-      opts.irlsTol, opts,
+    robust = robustFit(
+      ll5, x, responses, w, best, free, box.lower, box.upper, result.loss,
+      result.tuning, sst, result.n, opts,
     )
-    best = robustFit.fit
+    best = robust.fit
     result.converged = best.status.converged
-    if not robustFit.converged:
+    if not robust.converged:
       result.warnings.incl fwRobustNotConverged
-    u = newSeq[float](x.len)
-    result.robustWeights = newSeq[float](x.len)
-    for i in 0 ..< x.len:
-      if w[i] > 0.0:
-        if robustFit.scale > 0.0:
-          u[i] = robustFit.residuals[i] / robustFit.scale
-        result.robustWeights[i] = psiWeight(result.loss, u[i], result.tuning)
+    (u, result.robustWeights) = robust.robustUnits(w, result.loss, result.tuning)
 
   result.params = best.params.toParams
   for param in DrcParam:
@@ -1074,23 +1238,10 @@ proc fitCurveFrom(
       result.sigma = NaN
     varianceScale = result.sigma ^ 2
   else:
-    # Huber's correction, as MASS::rlm: κ²·S / mean(ψ')², where
-    # S = s²·Σψ(uᵢ)²/(n − p) and κ = 1 + p·var(ψ')/(n·mean(ψ')²).
-    let s = robustFit.scale
-    result.sigma = s
-    var
-      sumPsi2 = 0.0
-      derivative: RunningStat # of ψ'(uᵢ)
-    for i in 0 ..< x.len:
-      if w[i] > 0.0:
-        sumPsi2 += psi(result.loss, u[i], result.tuning) ^ 2
-        derivative.push(psiDerivative(result.loss, u[i], result.tuning))
-    let
-      meanD = derivative.mean
-      kappa =
-        1.0 + float(nFree) * derivative.varianceS / (float(result.n) * meanD * meanD)
-    if result.df > 0 and meanD > 0.0:
-      varianceScale = (kappa / meanD) ^ 2 * s * s * sumPsi2 / float(result.df)
+    result.sigma = robust.scale
+    varianceScale = robustVarianceScale(
+      result.loss, result.tuning, u, w, robust.scale, nFree, result.n, result.df
+    )
   if not unscaledCovariance(jtwj, free, unscaled):
     result.warnings.incl fwSingular
   if result.df == 0:
@@ -1184,6 +1335,33 @@ func boundNote(fit: DrcFit, param: DrcParam): string =
   else:
     ""
 
+func robustWeightNote(robustWeights: seq[float], n: int): string =
+  ## How many observations a robust fit downweighted or rejected.
+  var strong, rejected = 0
+  for rw in robustWeights:
+    if rw == 0.0:
+      inc rejected
+    elif rw < 0.5:
+      inc strong
+  # Observations the user excluded (weight 0) are not counted as rejected.
+  rejected -= robustWeights.len - n
+  &"Robust weight below 0.5: {strong} observations; 0 (rejected): {rejected}"
+
+func fallbackNote(
+    loss: Loss, usedFallback, fallbackConverged: bool, status: LMStatus, iterations: int
+): string =
+  ## How the fit stopped, for `summary`.
+  if usedFallback:
+    let outcome = if fallbackConverged: "converged" else: "did not converge"
+    result =
+      "Levenberg–Marquardt did not converge; the Nelder–Mead fallback " & outcome
+    if loss == Squared:
+      result.add &" (final polishing run: {status} after {iterations} iterations)"
+    else:
+      result.add &". Last reweighting round: {status} after {iterations} iterations"
+  else:
+    result = &"Stopped after {iterations} iterations: {status}"
+
 proc summary*(fit: DrcFit, level = 0.95): string =
   ## A printable table of estimates, standard errors and confidence intervals.
   let
@@ -1210,27 +1388,12 @@ proc summary*(fit: DrcFit, level = 0.95): string =
     result.add &"Residual standard error: {fit.sigma:.6g} on {fit.df} degrees of freedom\n"
     result.add &"R²: {fit.rSquared:.6g}   AIC: {fit.aic:.6g}   BIC: {fit.bic:.6g}\n"
   else:
-    var strong, rejected = 0
-    for rw in fit.robustWeights:
-      if rw == 0.0:
-        inc rejected
-      elif rw < 0.5:
-        inc strong
-    # Observations the user excluded (weight 0) are not counted as rejected.
-    rejected -= fit.robustWeights.len - fit.n
     result.add &"Robust residual scale (MAD): {fit.sigma:.6g} on {fit.df} degrees of freedom\n"
-    result.add &"Robust weight below 0.5: {strong} observations; 0 (rejected): {rejected}\n"
+    result.add robustWeightNote(fit.robustWeights, fit.n) & "\n"
     result.add &"R²: {fit.rSquared:.6g}\n"
-  if fit.usedFallback:
-    let outcome = if fit.fallbackConverged: "converged" else: "did not converge"
-    result.add "Levenberg–Marquardt did not converge; the Nelder–Mead fallback " &
-      outcome
-    if fit.loss == Squared:
-      result.add &" (final polishing run: {fit.status} after {fit.iterations} iterations)"
-    else:
-      result.add &". Last reweighting round: {fit.status} after {fit.iterations} iterations"
-  else:
-    result.add &"Stopped after {fit.iterations} iterations: {fit.status}"
+  result.add fallbackNote(
+    fit.loss, fit.usedFallback, fit.fallbackConverged, fit.status, fit.iterations
+  )
   for warning in fit.warnings:
     result.add &"\nWarning: {warning}"
 

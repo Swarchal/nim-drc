@@ -16,29 +16,27 @@ type
     evaluations*: int
     converged*: bool
 
-proc nelderMead*[K: static int, F](
-    f: F,
-    p0: array[K, float],
-    free: array[K, bool],
-    lower, upper: array[K, float],
-    opts = NMOptions(),
-): NMResult[K] =
-  ## Minimises `f(p: array[K, float]): float` over the parameters marked in
-  ## `free`, within `lower` ≤ p ≤ `upper` (±Inf for no bound), holding the
-  ## others at their value in `p0`. NaN values count as +Inf. Every vertex is
-  ## clamped into the bounds, as SciPy's bounded Nelder–Mead.
+  NMDynResult* = object ## `NMResult` for a parameter count known only at run time
+    params*: seq[float]
+    value*: float
+    evaluations*: int
+    converged*: bool
+
+proc nmCore[V, B, R; F](f: F, p0: V, free: B, lower, upper: V, opts: NMOptions): R =
+  ## The body of both `nelderMead` overloads: `V` is an `array[K, float]` or a
+  ## `seq[float]`, and `R` the matching result type.
   var idx: seq[int]
-  for j in 0 ..< K:
+  for j in 0 ..< p0.len:
     if free[j]:
       idx.add j
   let m = idx.len
 
-  proc project(p: array[K, float]): array[K, float] =
+  proc project(p: V): V =
     result = p
     for j in idx:
       result[j] = clamp(p[j], lower[j], upper[j])
 
-  template eval(p: array[K, float]): float =
+  template eval(p: V): float =
     inc result.evaluations
     let v = f(p)
     if v.isNaN: Inf else: v
@@ -54,7 +52,7 @@ proc nelderMead*[K: static int, F](
   # Initial simplex: the start plus a 10% step (or 0.1 from zero) along each
   # free axis, stepping down instead where that would cross the upper bound.
   var
-    simplex = newSeq[array[K, float]](m + 1)
+    simplex = newSeq[V](m + 1)
     values = newSeq[float](m + 1)
   for i in 0 .. m:
     simplex[i] = start
@@ -72,7 +70,7 @@ proc nelderMead*[K: static int, F](
           max(start[j] - step, lower[j])
     values[i] = eval(simplex[i])
 
-  proc along(a, b: array[K, float], t: float): array[K, float] =
+  proc along(a, b: V, t: float): V =
     ## a + t · (b − a) on the free coordinates, clamped into the bounds.
     result = a
     for j in idx:
@@ -137,6 +135,28 @@ proc nelderMead*[K: static int, F](
 
   result.params = simplex[0]
   result.value = values[0]
+
+proc nelderMead*[K: static int, F](
+    f: F,
+    p0: array[K, float],
+    free: array[K, bool],
+    lower, upper: array[K, float],
+    opts = NMOptions(),
+): NMResult[K] =
+  ## Minimises `f(p: array[K, float]): float` over the parameters marked in
+  ## `free`, within `lower` ≤ p ≤ `upper` (±Inf for no bound), holding the
+  ## others at their value in `p0`. NaN values count as +Inf. Every vertex is
+  ## clamped into the bounds, as SciPy's bounded Nelder–Mead.
+  nmCore[array[K, float], array[K, bool], NMResult[K], F](
+    f, p0, free, lower, upper, opts
+  )
+
+proc nelderMead*[F](
+    f: F, p0: seq[float], free: seq[bool], lower, upper: seq[float], opts = NMOptions()
+): NMDynResult =
+  ## As the array overload, for a parameter count known only at run time
+  ## (`f(p: seq[float]): float`).
+  nmCore[seq[float], seq[bool], NMDynResult, F](f, p0, free, lower, upper, opts)
 
 proc nelderMead*[K: static int, F](
     f: F, p0: array[K, float], free: array[K, bool], opts = NMOptions()

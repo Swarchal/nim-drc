@@ -205,6 +205,25 @@ suite "bootstrap: joint fits":
       check r.shared == fit.shared
       check r.curves.len == 3
 
-  test "curves of a joint fit cannot be bootstrapped alone":
+  test "robust joint fits refit with their loss and tuning":
+    let tukey = fitLL4Multi(
+      doses,
+      response,
+      curve,
+      shared = {Bottom, Top, Hill},
+      opts = FitOptions(loss: Tukey, tuning: 4.0),
+    )
+    let b = tukey.bootstrap(n = 10)
+    check b.replicates.len > 0
+    for r in b.replicates:
+      check r.loss == Tukey and r.tuning == 4.0
+
+  test "curves of a joint fit are bootstrapped through the joint fit":
     expect ValueError:
       discard fit.curves[0].bootstrap(n = 5)
+    let boot = fit.bootstrap(n = 50)
+    let ci = boot.bootCI(
+      proc(f: MultiFit): float =
+        f.curves[2].ec50
+    )
+    check ci.lower < fit.curves[2].ec50 and fit.curves[2].ec50 < ci.upper

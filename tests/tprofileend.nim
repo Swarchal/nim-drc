@@ -33,89 +33,30 @@ proc risesFarOut(x: float, p: ParamVec, grad: var ParamVec): float {.nimcall.} =
   grad[1] = -2e-3 * excess * x
   p[0] + 1e-3 * excess * excess * x
 
-suite "profile ends beyond the reach":
+proc endOf(
+    fn: proc(x: float, p: ParamVec, grad: var ParamVec): float {.nimcall.},
+    lower: ParamVec,
+    step, direction: float,
+    positive: bool,
+): float =
+  ## The end of parameter 1's profile, with no upper bounds.
   let upper = filled(Inf)
+  let tau = pinnedTau(fn, @x, @y, @w, 1, free, lower, upper, ssrHat, 1.0, LMOptions())
+  profileEnd(tau, pHat, pHat[1], lower[1], upper[1], tq, step, direction, positive)
 
+suite "profile ends beyond the reach":
   test "a positive parameter's end is 0, never evaluated there":
     # The reach (10·tq·step = 0.02) is passed long before 0.
     let lower = filled(-Inf)
-    check profileEnd(
-      nanAtZero,
-      x,
-      y,
-      w,
-      pHat,
-      1,
-      free,
-      lower,
-      upper,
-      ssrHat,
-      1.0,
-      tq,
-      1e-3,
-      -1.0,
-      true,
-      LMOptions(),
-    ) == 0.0
+    check endOf(nanAtZero, lower, 1e-3, -1.0, true) == 0.0
     # Within the reach, 0 is approached by halving.
-    check profileEnd(
-      nanAtZero,
-      x,
-      y,
-      w,
-      pHat,
-      1,
-      free,
-      lower,
-      upper,
-      ssrHat,
-      1.0,
-      tq,
-      0.1,
-      -1.0,
-      true,
-      LMOptions(),
-    ) == 0.0
+    check endOf(nanAtZero, lower, 0.1, -1.0, true) == 0.0
 
   test "a loose bound beyond the reach is the end, without a refit there":
     var lower = filled(-Inf)
     lower[1] = -1e6
-    check profileEnd(
-      risesFarOut,
-      x,
-      y,
-      w,
-      pHat,
-      1,
-      free,
-      lower,
-      upper,
-      ssrHat,
-      1.0,
-      tq,
-      1e-3,
-      -1.0,
-      false,
-      LMOptions(),
-    ) == -1e6
-    check profileEnd(
-      risesFarOut,
-      x,
-      y,
-      w,
-      pHat,
-      1,
-      free,
-      filled(-Inf),
-      upper,
-      ssrHat,
-      1.0,
-      tq,
-      1e-3,
-      -1.0,
-      false,
-      LMOptions(),
-    ) == -Inf
+    check endOf(risesFarOut, lower, 1e-3, -1.0, false) == -1e6
+    check endOf(risesFarOut, filled(-Inf), 1e-3, -1.0, false) == -Inf
 
   test "within the reach, a crossing is found as before":
     # With a large step the reach (2000) covers the rise past −100. With the
@@ -123,22 +64,5 @@ suite "profile ends beyond the reach":
     # k = (2 + √84)/10, i.e. β = −100 − √(1000·k).
     var lower = filled(-Inf)
     lower[1] = -1e3
-    let e = profileEnd(
-      risesFarOut,
-      x,
-      y,
-      w,
-      pHat,
-      1,
-      free,
-      lower,
-      upper,
-      ssrHat,
-      1.0,
-      tq,
-      100.0,
-      -1.0,
-      false,
-      LMOptions(),
-    )
+    let e = endOf(risesFarOut, lower, 100.0, -1.0, false)
     check abs(e - (-100.0 - sqrt(1000.0 * (2.0 + sqrt(84.0)) / 10.0))) < 1e-6

@@ -2,6 +2,7 @@ import std/[math, strutils, unittest]
 import drc
 import drc/linalg
 import ryegrass
+import fixtures
 
 proc close(a, b: float, rel: float): bool =
   abs(a - b) <= rel * max(1e-3, abs(b))
@@ -11,25 +12,6 @@ proc near(a, b, se: float, k = 2e-5): bool =
   ## R's nls included, stop short of the exact optimum by about this much
   ## along poorly determined directions (e.g. a Bottom near 0).
   abs(a - b) <= k * se
-
-# R's DNase data, runs 1, 4 and 8 (curves 0, 1, 2).
-const
-  dnaseConc = [
-    0.04882812, 0.04882812, 0.1953125, 0.1953125, 0.390625, 0.390625, 0.78125, 0.78125,
-    1.5625, 1.5625, 3.125, 3.125, 6.25, 6.25, 12.5, 12.5,
-  ]
-  dnaseDensity = [
-    0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374, 0.614, 0.609, 1.019, 1.001,
-    1.334, 1.364, 1.73, 1.71, 0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364, 0.36, 0.62,
-    0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732, 0.054, 0.054, 0.152, 0.148, 0.226,
-    0.222, 0.392, 0.383, 0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724,
-  ]
-
-proc dnase(): tuple[doses: seq[float], curve: seq[int]] =
-  for c in 0 .. 2:
-    for d in dnaseConc:
-      result.doses.add d
-      result.curve.add c
 
 proc ll4Seq(x: float, p: seq[float], grad: var seq[float]): float =
   ## ll5 with Asymmetry = 1, through the runtime-sized interface.
@@ -394,7 +376,9 @@ suite "joint fits: input checks":
     expect ValueError:
       discard fitLL4Multi(doses, dnaseDensity, curve, weights = w)
     expect ValueError:
-      discard fitLL4Multi(doses, dnaseDensity, curve, opts = FitOptions(loss: Huber))
+      discard fitLL4Multi(
+        doses, dnaseDensity, curve, opts = FitOptions(loss: Huber, tuning: -1.0)
+      )
     expect ValueError:
       discard fitLL4Multi(doses, dnaseDensity, curve, fixed = [(Asymmetry, 2.0)])
 
@@ -468,3 +452,143 @@ suite "MultiFit accessors":
       discard fit.param(3, Hill)
     expect ValueError:
       discard fit.cov(0, Hill, -1, Hill)
+
+suite "robust joint fits match robustbase::nlrob":
+  # The README's potency data with gross errors added at observations 5, 22
+  # and 47; parallel curves. R: nlrob() with the indexed formula written out
+  # (b + (t-b)/(1+10^((l0*(c==0)+l1*(c==1)+l2*(c==2)-x)*h))), started from
+  # nls() for Huber and from a Huber fit at nlrob's default tolerance for
+  # bisquare, both run to tol = 1e-12. Standard errors follow MASS::rlm's
+  # covariance, computed in R from a finite-difference Jacobian at the
+  # nlrob fit (as tirls.nim).
+  let (doses, curve) = potencyDesign()
+  var response = @potencyResponse
+  response[5] += 0.6
+  response[22] -= 0.5
+  response[47] += 0.6
+  let
+    huber = fitLL4Multi(
+      doses,
+      response,
+      curve,
+      shared = {Bottom, Top, Hill},
+      opts = FitOptions(loss: Huber),
+    )
+    tukey = fitLL4Multi(
+      doses,
+      response,
+      curve,
+      shared = {Bottom, Top, Hill},
+      opts = FitOptions(loss: Tukey),
+    )
+    # R's coefficient order b, t, h, l0, l1, l2 as (curve, parameter)
+    coefs = [(0, Bottom), (0, Top), (0, Hill), (0, LogEC50), (1, LogEC50), (2, LogEC50)]
+
+  test "Huber":
+    check huber.converged
+    check huber.warnings == {}
+    check huber.loss == Huber and huber.tuning == 1.345
+    let
+      expected = [
+        0.062090094158708059, 1.9976807979794629, 1.1042505388247708,
+        -0.014497824016666246, -0.5813732251833873, 0.69134185114528857,
+      ]
+      se = [
+        0.012114911583969381, 0.012460799742694534, 0.032703034698909401,
+        0.017972175667133758, 0.017943567860478588, 0.017928420067593331,
+      ]
+    for i, (c, param) in coefs:
+      check close(huber.param(c, param), expected[i], 2e-5)
+      check close(sqrt(huber.cov(c, param, c, param)), se[i], 2e-5)
+    check close(huber.cov(0, LogEC50, 1, LogEC50), 8.3784727733646073e-05, 2e-5)
+    check close(huber.sigma, 0.034384829058765283, 2e-5)
+    for (i, rw) in [
+      (3, 0.89632501842134193),
+      (5, 0.083651502066434541),
+      (22, 0.095453255431882197),
+      (47, 0.075077240610943508),
+    ]:
+      check close(huber.robustWeights[i], rw, 2e-5)
+
+  test "Tukey rejects the gross errors":
+    check tukey.converged
+    let
+      expected = [
+        0.060824822915289144, 1.99836551884469, 1.1026026211419602,
+        -0.011923882480351143, -0.59272372873542711, 0.70115412862418891,
+      ]
+      se = [
+        0.011224534946907349, 0.011547616490340406, 0.030194275100864858,
+        0.016651858014354825, 0.01662432277325401, 0.01660974894374281,
+      ]
+    for i, (c, param) in coefs:
+      check close(tukey.param(c, param), expected[i], 1e-5)
+      check close(sqrt(tukey.cov(c, param, c, param)), se[i], 1e-5)
+    check close(tukey.sigma, 0.032876363476044078, 1e-5)
+    var rejected: seq[int]
+    for i, rw in tukey.robustWeights:
+      if rw == 0.0:
+        rejected.add i
+    check rejected == @[5, 22, 47]
+    check close(tukey.robustWeights[13], 0.40872327465844011, 1e-5)
+
+  test "the curves carry the robust scale, weights and covariance":
+    for c in 0 .. 2:
+      let view = huber.curves[c]
+      check view.loss == Huber and view.tuning == 1.345
+      check view.sigma == huber.sigma
+      check view.robustWeights == huber.robustWeights[18 * c ..< 18 * (c + 1)]
+      check view.se[LogEC50] == sqrt(huber.cov(c, LogEC50, c, LogEC50))
+    let ci = huber.curves[1].ec50CI
+    check ci.lower < huber.curves[1].ec50 and huber.curves[1].ec50 < ci.upper
+
+  test "no likelihood-based criteria or F tests":
+    check huber.logLik.isNaN and huber.aic.isNaN and huber.bic.isNaN
+    let separate = fitLL4Multi(doses, response, curve, opts = FitOptions(loss: Huber))
+    expect ValueError:
+      discard fTest(huber, separate)
+    expect ValueError:
+      discard huber.lackOfFit
+
+  test "summary":
+    let text = tukey.summary
+    check "robust (Tukey bisquare, tuning 4.685); shared: Bottom, Top, Hill" in text
+    check "Robust residual scale (MAD)" in text
+    check "0 (rejected): 3" in text
+    check "AIC" notin text
+
+suite "joint fits: Nelder–Mead fallback":
+  let (doses, curve) = potencyDesign()
+  let reference =
+    fitLL4Multi(doses, potencyResponse, curve, shared = {Bottom, Top, Hill})
+
+  test "recovers when Levenberg–Marquardt does not converge":
+    let starved = FitOptions(lm: LMOptions(maxIter: 2), multiStart: false)
+    let fit = fitLL4Multi(
+      doses, potencyResponse, curve, shared = {Bottom, Top, Hill}, opts = starved
+    )
+    check fit.usedFallback and fit.fallbackConverged and fit.converged
+    check fit.curves[0].usedFallback
+    check close(fit.ssr, reference.ssr, 1e-10)
+    for c in 0 .. 2:
+      for param in Bottom .. Hill:
+        check near(
+          fit.param(c, param),
+          reference.param(c, param),
+          sqrt(reference.cov(c, param, c, param)),
+          1e-5,
+        )
+    check "Nelder–Mead fallback converged" in fit.summary
+
+  test "without the fallback, non-convergence is reported":
+    var starved = FitOptions(lm: LMOptions(maxIter: 2), multiStart: false)
+    starved.fallback = false
+    let fit = fitLL4Multi(
+      doses, potencyResponse, curve, shared = {Bottom, Top, Hill}, opts = starved
+    )
+    check not fit.usedFallback
+    check not fit.converged
+    check fwNotConverged in fit.warnings
+
+  test "is not used when Levenberg–Marquardt converges":
+    check not reference.usedFallback

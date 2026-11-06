@@ -45,3 +45,22 @@ proc ryegrassCurves*(
       result.doses.add d * (if c == 0: 1.0 else: scale)
       result.responses.add ryegrassRootLength[i]
       result.curve.add c
+
+# R's DNase data, runs 1, 4 and 8 (curves 0, 1, 2).
+const
+  dnaseConc* = [
+    0.04882812, 0.04882812, 0.1953125, 0.1953125, 0.390625, 0.390625, 0.78125, 0.78125,
+    1.5625, 1.5625, 3.125, 3.125, 6.25, 6.25, 12.5, 12.5,
+  ]
+  dnaseDensity* = [
+    0.017, 0.018, 0.121, 0.124, 0.206, 0.215, 0.377, 0.374, 0.614, 0.609, 1.019, 1.001,
+    1.334, 1.364, 1.73, 1.71, 0.011, 0.016, 0.118, 0.108, 0.2, 0.206, 0.364, 0.36, 0.62,
+    0.64, 0.979, 0.973, 1.424, 1.399, 1.74, 1.732, 0.054, 0.054, 0.152, 0.148, 0.226,
+    0.222, 0.392, 0.383, 0.658, 0.644, 1.043, 1.002, 1.466, 1.381, 1.743, 1.724,
+  ]
+
+proc dnase*(): tuple[doses: seq[float], curve: seq[int]] =
+  for c in 0 .. 2:
+    for d in dnaseConc:
+      result.doses.add d
+      result.curve.add c

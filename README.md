@@ -11,7 +11,8 @@ Dose-response curve fitting for Nim, with no dependencies beyond the standard li
 - Inverse prediction: doses read off a standard curve, with calibration intervals
 - Confidence and prediction bands for the fitted curve
 - Joint fits of several curves with shared parameters (e.g. parallel curves),
-  relative potency with confidence intervals, and F tests between nested fits
+  least-squares or robust, relative potency with confidence intervals, and F
+  tests between nested fits
 - Results validated against R (`nls`, `robustbase::nlrob`, and the published `drc` estimates for its `ryegrass` dataset)
 
 ## Installation
@@ -316,11 +317,20 @@ intervals hide that. The profile intervals show it as an infinite end.
   standard errors is taken as the end without a refit there, for the same
   reason as an infinite end.
 - **For ECx**, the model is rewritten with log10(ECx) in place of LogEC50,
-  which is then profiled. It works for 5PL fits too, and is not available
-  when LogEC50 is fixed or bounded.
+  which is then profiled. It works for 5PL fits too. If LogEC50 is fixed or
+  bounded, each refit is instead constrained to have that ECx (by an
+  augmented Lagrangian, within the bounds). With LogEC50 fixed, a 4PL's
+  EC50 is known exactly, so its interval is the estimate itself.
+- **Joint fits:** `profileCI(fit, curve, param)`, `ecxProfileCI(fit, curve, pct)`
+  and `ec50ProfileCI(fit, curve)` profile one curve of a `MultiFit`,
+  refitting all of the curves.
 - **Cost:** each interval refits the curve many times, so it takes about as
-  long as one fit (0.25 ms for the ryegrass 4PL). Least-squares fits only,
-  and not for the curves of a joint fit. `opts.lm` controls the refits.
+  long as one fit (0.25 ms for the ryegrass 4PL). `opts.lm` controls the
+  refits.
+- **Robust fits** have no profile intervals. Their objective is not a
+  likelihood, so there is no τ to compare with a t quantile, and
+  `robustbase::nlrob` does not offer profiles either. Use the Wald
+  intervals or `bootstrap`.
 
 ### Bootstrap intervals
 
@@ -571,7 +581,12 @@ How a robust fit works:
   no outliers.
 - **Standard errors** use Huber's covariance correction (as `MASS::rlm`), and
   `fit.sigma` is the robust scale. `logLik`, `aic` and `bic` are NaN, since a
-  robust fit is not a likelihood fit.
+  robust fit does not maximise a likelihood. A Gaussian log-likelihood at the
+  robust estimate would be misleading, and R's `nlrob` has no `logLik` or
+  `AIC` either. Likewise, profile intervals, `lackOfFit` and `fTest` need
+  least-squares fits.
+- **Joint fits** take the same `opts`: `fitLL4Multi(…, opts = FitOptions(loss: Tukey))`
+  reweights all the curves together, with one robust scale.
 - **`fit.robustWeights`** holds each observation's final weight: 1 means not
   downweighted, 0 means rejected.
 
@@ -666,8 +681,13 @@ contain the simulated values (4 and 0.2).
   `anova`: for example parallel against separate curves, a 4PL against a 5PL,
   or one pooled curve (all curve ids 0) against several.
 - **`fixed`** parameters are held at one value for every curve.
-- Joint fits use least squares only, without the Nelder–Mead fallback.
-  Starting values come from fitting each curve on its own.
+- **Fitting:** starting values come from fitting each curve on its own. As
+  for one curve, Nelder–Mead takes over if Levenberg–Marquardt does not
+  converge, and `opts.loss` gives a robust fit.
+- **`logLik`, `aic` and `bic` are NaN on `fit.curves[c]`**, because a curve's
+  share of a joint fit is not a model of its own. Its parameter count would
+  be ambiguous (shared parameters belong to every curve), and σ comes from
+  all the curves. Compare joint fits by their own AIC, or with `fTest`.
 
 Continuing the example, the potency of sample A with three kinds of interval:
 
@@ -688,8 +708,13 @@ potency of A, 95% CI: delta 3.486–4.155, profile 3.486–4.155, bootstrap 3.49
 - **`relativePotencyProfileCI(a, b, pct = 50)`** is the profile-likelihood
   interval for the potency ratio. The joint model is rewritten with
   log10(ECx(a)/ECx(b)) as a parameter, and that is profiled as in
-  `profileCI`. It needs LogEC50 to be fitted separately for each curve
-  (not shared, fixed or bounded).
+  `profileCI`. If LogEC50 is shared, fixed or bounded, each refit is instead
+  constrained to the ratio. 4PL curves that share LogEC50 have the same
+  EC50, so their EC50 ratio is exactly 1.
+- **For one curve's statistic from the bootstrap**, resample the joint fit
+  and take that curve in each replicate:
+  `boot.bootCI(proc(f: MultiFit): float = f.curves[2].ec50)`. A curve can't
+  be bootstrapped on its own, because its fit depends on the other curves.
 - **Fieller's theorem**, the classical choice for potency ratios, gives the
   same interval as the delta method here. Fieller applies to a ratio of
   estimates on the dose scale, but the potency here is a difference on the
@@ -845,7 +870,8 @@ The tests compare against reference values from R:
 - **Bands:** delta-method confidence and prediction bands, computed in R with
   finite-difference gradients, for 4PL and 5PL fits.
 - **Robust fits:** `robustbase::nlrob` coefficients, scale and weights for
-  Huber and Tukey fits of data with outliers. Standard errors are checked
+  Huber and Tukey fits of data with outliers, single and joint (with the
+  joint formula written out for `nlrob`). Standard errors are checked
   against `MASS::rlm`'s covariance formula, computed independently in R.
 - **Bounds:** `nls(algorithm = "port")` fits with bounds active on Bottom,
   Top, Hill and 5PL Asymmetry, and on a joint fit's shared Top; a bounded
@@ -862,7 +888,10 @@ The tests compare against reference values from R:
   finding on the profile t statistic with `nls` refits (`port` within
   bounds), for 3PL, 4PL (weighted and unweighted), 5PL, bounded fits and a
   partial curve, including ECx intervals, and for relative potency in
-  joint fits (parallel and separate curves, EC50 and EC10). They agree with R's own
+  joint fits (parallel and separate curves, EC50 and EC10). With LogEC50
+  fixed, shared or bounded, R eliminates one parameter through the ECx
+  instead (e.g. Asymmetry in a 5PL), independently of the constrained
+  refits here. Joint fits' parameters and ECx are checked the same way. They agree with R's own
   spline-based `confint` to about 1e-4. R's refits stop short where a
   plateau runs off to infinity, so those ends are instead checked against a
   multi-start fit with the parameter fixed there.

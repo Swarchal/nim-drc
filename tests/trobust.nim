@@ -34,6 +34,21 @@ suite "Nelder–Mead":
     check r.params == [-1.2, 1.0, 0.5]
     check r.value == rosenbrock([-1.2, 1.0, 0.5])
 
+  test "the seq overload takes the same steps as the array one":
+    proc rosenbrockSeq(p: seq[float]): float =
+      rosenbrock([p[0], p[1], p[2]])
+
+    let lower = [-Inf, -Inf, 0.2]
+    let upper = [0.9, Inf, Inf]
+    let a = nelderMead(rosenbrock, [-1.2, 1.0, 0.5], [true, true, true], lower, upper)
+    let s =
+      nelderMead(rosenbrockSeq, @[-1.2, 1.0, 0.5], @[true, true, true], @lower, @upper)
+    check s.params == @(a.params)
+    check s.value == a.value
+    check s.evaluations == a.evaluations
+    check s.converged == a.converged
+    check s.params[0] <= 0.9 and abs(s.params[2] - 0.2) < 1e-6
+
   test "stops at maxEval":
     let r = nelderMead(
       rosenbrock, [-1.2, 1.0, 0.5], [true, true, true], NMOptions(maxEval: 20)
