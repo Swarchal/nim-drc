@@ -687,9 +687,6 @@ proc checkProfile(fit: MultiFit) =
     raise
       newException(ValueError, "profile-likelihood intervals need a least-squares fit")
 
-func antilog(ci: ConfInt): ConfInt =
-  (pow(10.0, ci.lower), pow(10.0, ci.upper))
-
 proc pinnedTau(
     fit: MultiFit, problem: JointProblem, slot: int, opts: FitOptions
 ): ProfileTau[seq[float]] =

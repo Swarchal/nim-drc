@@ -461,6 +461,49 @@ proc pinnedTau[F, V, B](
     params = r.params
     profileTauOf(r.ssr, ssrHat, sigma)
 
+proc constrainedRefit[F, G, V, B](
+    augmented: F,
+    g: G,
+    xa: seq[float],
+    ya: var seq[float],
+    wa: seq[float],
+    start: V,
+    free: B,
+    lower, upper: V,
+    beta, scale: float,
+    lm: LMOptions,
+): tuple[params: V, lambda, violation: float, feasible: bool] =
+  ## The fit from `start` that minimises the SSR subject to g(p) = β, within
+  ## the bounds, by the augmented Lagrangian method (see `constrainedTau`).
+  ## `xa`, `ya` and `wa` are the data with the constraint's observation last,
+  ## its weight being μ; its response is set here. Levenberg–Marquardt refits
+  ## and λ ← λ + μ·(g − β) until g = β. Returns the multiplier λ and the
+  ## remaining `violation` g − β; not `feasible` if no fit within the bounds
+  ## has g = β.
+  let
+    mu = wa[^1]
+    exact = 1e-10 * scale # stop here
+    tolerance = 1e-6 * scale # accept up to here (Levenberg–Marquardt's own precision)
+  var
+    p = start
+    lambda = 0.0
+    violation = Inf
+    grad: V
+  grad.ensureLen p.len
+  for _ in 0 ..< 30:
+    ya[^1] = beta - lambda / mu
+    p = levenbergMarquardt(augmented, xa, ya, wa, p, free, lower, upper, lm).params
+    let v = g(p, grad) - beta
+    if not v.isFinite:
+      violation = v
+      break
+    let previous = violation
+    violation = v
+    lambda += mu * v
+    if abs(v) <= exact or (abs(v) <= tolerance and abs(v) > 0.1 * abs(previous)):
+      break # converged, or at the limit of the refits' precision
+  (p, lambda, violation, abs(violation) <= tolerance)
+
 proc constrainedTau[F, G, V, B](
     fn: F,
     g: G,
@@ -472,51 +515,68 @@ proc constrainedTau[F, G, V, B](
 ): ProfileTau[V] =
   ## τ for a function g(p) of the parameters (`g(p, grad)` returns it and
   ## writes its gradient), with standard error about `scale`: each refit
-  ## minimises the SSR subject to g(p) = β, within the bounds. The constraint
-  ## is imposed by the augmented Lagrangian method, as one extra observation
-  ## (x = NaN) with response β − λ/μ, value g(p) and weight μ, refitting by
-  ## Levenberg–Marquardt and updating λ ← λ + μ·(g − β) until g = β. μ makes
-  ## the extra term ~1000× as curved as the SSR along g, so each round cuts
-  ## the violation ~1000-fold. Inf if no fit within the bounds has g = β.
-  let
-    mu = 1e3 * (sigma / scale) ^ 2
-    exact = 1e-10 * scale # stop here
-    feasible = 1e-6 * scale # accept up to here (Levenberg–Marquardt's own precision)
-  var xa = x
+  ## minimises the SSR subject to g(p) = β, within the bounds
+  ## (`constrainedRefit`). The constraint is imposed by the augmented
+  ## Lagrangian method, as one extra observation (x = NaN) with response
+  ## β − λ/μ, value g(p) and weight μ. μ makes the extra term ~1000× as
+  ## curved as the SSR along g, so each round cuts the violation ~1000-fold.
+  ## Inf if no fit within the bounds has g = β.
+  var
+    xa = x
+    ya = y
+    wa = w
   xa.add NaN
-  var wa = w
-  wa.add mu
+  ya.add 0.0
+  wa.add 1e3 * (sigma / scale) ^ 2 # μ
   let augmented = proc(xi: float, p: V, grad: var V): float =
     if xi.isNaN:
       g(p, grad)
     else:
       fn(xi, p, grad)
   result = proc(beta: float, start: V, params: var V): float =
-    var
-      ya = y
-      p = start
-      lambda = 0.0
-      violation = Inf
-      grad: V
-    ya.add 0.0
-    grad.ensureLen p.len
-    for _ in 0 ..< 30:
-      ya[^1] = beta - lambda / mu
-      p = levenbergMarquardt(augmented, xa, ya, wa, p, free, lower, upper, lm).params
-      let v = g(p, grad) - beta
-      if not v.isFinite:
-        return Inf
-      let previous = violation
-      violation = v
-      lambda += mu * v
-      if abs(v) <= exact or (abs(v) <= feasible and abs(v) > 0.1 * abs(previous)):
-        break # converged, or at the limit of the refits' precision
-    if not (abs(violation) <= feasible):
+    let fit = constrainedRefit(
+      augmented, g, xa, ya, wa, start, free, lower, upper, beta, scale, lm
+    )
+    if not fit.feasible:
       return Inf
-    params = p
+    params = fit.params
     # S at g = β exactly, to first order: the profile's slope is −2λ.
-    let s = weightedSsr(fn, x, y, w, p) + 2.0 * lambda * violation
+    let s = weightedSsr(fn, x, y, w, fit.params) + 2.0 * fit.lambda * fit.violation
     profileTauOf(s, ssrHat, sigma)
+
+proc profileCrossing[V](
+    tau: ProfileTau[V], innerP: V, inner, innerTau, outer, outerTau, tq, step: float
+): float =
+  ## The β between `inner` (where τ = `innerTau` < `tq`, with refit `innerP`)
+  ## and `outer` (where τ = `outerTau` ≥ `tq`) at which τ(β) = `tq`, by the
+  ## Illinois method, to within 1e-12·`step`. Each refit starts from the
+  ## nearest one found inside the crossing.
+  var
+    (a, ga) = (inner, innerTau - tq) # ga < 0
+    (b, gb) = (outer, outerTau - tq) # gb ≥ 0
+    side = 0
+    start = innerP
+    p = innerP
+  for _ in 0 ..< 200:
+    if abs(b - a) <= 1e-12 * step:
+      break
+    var c = (a * gb - b * ga) / (gb - ga)
+    if not (c > min(a, b) and c < max(a, b)):
+      c = 0.5 * (a + b) # e.g. gb = Inf
+    let gc = tau(c, start, p) - tq
+    if gc == 0.0:
+      return c
+    if gc < 0.0:
+      (a, ga, start) = (c, gc, p)
+      if side == -1:
+        gb *= 0.5
+      side = -1
+    else:
+      (b, gb) = (c, gc)
+      if side == 1:
+        ga *= 0.5
+      side = 1
+  0.5 * (a + b)
 
 proc profileEnd[V](
     tau: ProfileTau[V],
@@ -527,7 +587,7 @@ proc profileEnd[V](
   ## One end of a profile-likelihood interval: the value β, beyond `center`
   ## (the estimate) in `direction` (±1), at which τ(β) reaches `tq`. It steps
   ## outwards from `center` (by `step`, growing 1.5× each time) until τ passes
-  ## `tq`, then finds the crossing by the Illinois method. Each refit starts
+  ## `tq`, then finds the crossing (`profileCrossing`). Each refit starts
   ## from the nearest point inside the crossing (`pHat` at first), so the
   ## profile follows one valley. If τ stays below `tq` up to `lower` or
   ## `upper`, that bound is the end (0 for a `positive` quantity, i.e.
@@ -576,30 +636,7 @@ proc profileEnd[V](
   if not found:
     return limit # only reachable when approaching Asymmetry's 0
 
-  var
-    (a, ga) = (inner, innerTau - tq) # ga < 0
-    (b, gb) = (outer, outerTau - tq) # gb ≥ 0
-    side = 0
-  for _ in 0 ..< 200:
-    if abs(b - a) <= 1e-12 * step:
-      break
-    var c = (a * gb - b * ga) / (gb - ga)
-    if not (c > min(a, b) and c < max(a, b)):
-      c = 0.5 * (a + b) # e.g. gb = Inf
-    let gc = tau(c, innerP, p) - tq
-    if gc == 0.0:
-      return c
-    if gc < 0.0:
-      (a, ga, innerP) = (c, gc, p)
-      if side == -1:
-        gb *= 0.5
-      side = -1
-    else:
-      (b, gb) = (c, gc)
-      if side == 1:
-        ga *= 0.5
-      side = 1
-  0.5 * (a + b)
+  profileCrossing(tau, innerP, inner, innerTau, outer, outerTau, tq, step)
 
 func profileStep(se, center: float): float =
   ## The first step out from the estimate: its standard error `se`, or
@@ -648,6 +685,21 @@ proc profileData(
     result.free[ord(param)] = param notin fit.fixed
   result.box = (fit.lower.toVec, fit.upper.toVec)
 
+func antilog(ci: ConfInt): ConfInt =
+  (pow(10.0, ci.lower), pow(10.0, ci.upper))
+
+proc pinnedTau[F](
+    fit: DrcFit, model: F, j: int, opts: FitOptions
+): ProfileTau[ParamVec] =
+  ## τ for parameter j of `model`, refitted to the fit's data: each refit
+  ## holds it at β. `model` is `ll5` or a reparametrisation that fits equally
+  ## well.
+  let (x, free, box) = fit.profileData
+  pinnedTau(
+    model, x, fit.responses, fit.weights, j, free, box.lower, box.upper, fit.ssr,
+    fit.sigma, opts.lm,
+  )
+
 proc profileCI*(
     fit: DrcFit, param: DrcParam, level = 0.95, opts = FitOptions()
 ): ConfInt =
@@ -666,17 +718,12 @@ proc profileCI*(
   let tq = fit.tQuantile(level)
   if param in fit.fixed:
     return (fit.params[param], fit.params[param])
-  let (x, free, box) = fit.profileData
-  let j = ord(param)
   profileInterval(
-    pinnedTau(
-      ll5, x, fit.responses, fit.weights, j, free, box.lower, box.upper, fit.ssr,
-      fit.sigma, opts.lm,
-    ),
+    fit.pinnedTau(ll5, ord(param), opts),
     fit.params.toVec,
     fit.params[param],
-    box.lower[j],
-    box.upper[j],
+    fit.lower[param],
+    fit.upper[param],
     fit.sigma,
     tq,
     fit.se[param],
@@ -726,6 +773,37 @@ proc constrainedInterval[F, G, V, B](
   )
   profileInterval(tau, pHat, center, -Inf, Inf, sigma, tq, se)
 
+proc constrainedInterval[G](
+    fit: DrcFit, g: G, tq, se: float, opts: FitOptions
+): ConfInt =
+  ## The profile-likelihood interval for g(parameters), whose delta-method
+  ## standard error is `se`: each refit is constrained to g.
+  let (x, free, box) = fit.profileData
+  constrainedInterval(
+    ll5, g, x, fit.responses, fit.weights, fit.params.toVec, free, box.lower, box.upper,
+    fit.ssr, fit.sigma, tq, se, opts.lm,
+  )
+
+proc ecxModel(r: float): proc(x: float, q: ParamVec, grad: var ParamVec): float =
+  ## `ll5` reparametrised for the ECx at which the curve is the fraction
+  ## r = sᴬ of the way from Bottom to Top: q is the parameter vector with
+  ## q[LogEC50] = log10(ECx), so LogEC50 = log10(ECx) + z/Hill (see
+  ## `zOffset`).
+  # z depends only on Asymmetry, so it is kept between calls.
+  var cachedA = NaN
+  var z, dzda: float
+  result = proc(x: float, q: ParamVec, grad: var ParamVec): float =
+    let (h, a) = (q[ord(Hill)], q[ord(Asymmetry)])
+    if a != cachedA:
+      let o = zOffset(r, a)
+      (z, dzda, cachedA) = (o.z, o.dzda, a)
+    var p = q
+    p[ord(LogEC50)] = q[ord(LogEC50)] + z / h
+    result = ll5(x, p, grad)
+    let dl = grad[ord(LogEC50)]
+    grad[ord(Hill)] -= dl * z / (h * h)
+    grad[ord(Asymmetry)] += dl * dzda / h
+
 proc ecxProfileCI*(
     fit: DrcFit, pct: float, level = 0.95, opts = FitOptions()
 ): ConfInt =
@@ -739,63 +817,29 @@ proc ecxProfileCI*(
   fit.checkProfile
   let tq = fit.tQuantile(level)
   let r = fractionAt(fit.params[Hill], pct)
-  let (x, free, box) = fit.profileData
   let (logEcx, grad) = fit.logEcxAndGradient(pct)
   let se = sqrt(fit.deltaVariance(grad, LogEC50 .. Asymmetry))
   if LogEC50 in fit.fixed or fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
     var slots: array[DrcParam, int]
     for param in DrcParam:
       slots[param] = ord(param)
-    let ci = constrainedInterval(
-      ll5,
-      logEcxConstraint[ParamVec](slots, r),
-      x,
-      fit.responses,
-      fit.weights,
-      fit.params.toVec,
-      free,
-      box.lower,
-      box.upper,
-      fit.ssr,
+    return antilog(
+      fit.constrainedInterval(logEcxConstraint[ParamVec](slots, r), tq, se, opts)
+    )
+  var q = fit.params.toVec
+  q[ord(LogEC50)] = logEcx
+  antilog(
+    profileInterval(
+      fit.pinnedTau(ecxModel(r), ord(LogEC50), opts),
+      q,
+      logEcx,
+      -Inf,
+      Inf,
       fit.sigma,
       tq,
       se,
-      opts.lm,
     )
-    return (pow(10.0, ci.lower), pow(10.0, ci.upper))
-  # q is the parameter vector with q[LogEC50] = log10(ECx), so
-  # LogEC50 = log10(ECx) + z/Hill (see `zOffset`). z depends only on
-  # Asymmetry, so it is kept between calls.
-  var cachedA = NaN
-  var z, dzda: float
-  let model = proc(x: float, q: ParamVec, grad: var ParamVec): float =
-    let (h, a) = (q[ord(Hill)], q[ord(Asymmetry)])
-    if a != cachedA:
-      let o = zOffset(r, a)
-      (z, dzda, cachedA) = (o.z, o.dzda, a)
-    var p = q
-    p[ord(LogEC50)] = q[ord(LogEC50)] + z / h
-    result = ll5(x, p, grad)
-    let dl = grad[ord(LogEC50)]
-    grad[ord(Hill)] -= dl * z / (h * h)
-    grad[ord(Asymmetry)] += dl * dzda / h
-  var q = fit.params.toVec
-  q[ord(LogEC50)] = logEcx
-  let j = ord(LogEC50)
-  let ci = profileInterval(
-    pinnedTau(
-      model, x, fit.responses, fit.weights, j, free, box.lower, box.upper, fit.ssr,
-      fit.sigma, opts.lm,
-    ),
-    q,
-    logEcx,
-    -Inf,
-    Inf,
-    fit.sigma,
-    tq,
-    se,
   )
-  (pow(10.0, ci.lower), pow(10.0, ci.upper))
 
 proc ec50ProfileCI*(fit: DrcFit, level = 0.95, opts = FitOptions()): ConfInt =
   fit.ecxProfileCI(50.0, level, opts)
