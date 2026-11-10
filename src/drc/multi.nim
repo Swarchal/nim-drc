@@ -80,6 +80,20 @@ proc sharedStart(param: DrcParam, values: openArray[float]): float =
   else:
     median(values)
 
+type
+  JointModel = proc(i: float, p: seq[float], grad: var seq[float]): float
+
+  CurveData = tuple[doses, responses, weights: seq[float]] ## one curve's observations
+
+  JointProblem = object
+    ## A joint fit as the optimisers see it: least squares over the joint
+    ## vector, with the observation index as x.
+    model: JointModel
+    obs: seq[float] ## 0, 1, …, n − 1
+    y, w: seq[float]
+    free: seq[bool] ## false for the slots of fixed parameters
+    lower, upper: seq[float] ## the bounds on each slot
+
 func observationIndex(n: int): seq[float] =
   ## 0, 1, …, n − 1: the x that LM sees for a joint fit.
   result = newSeq[float](n)
@@ -88,7 +102,7 @@ func observationIndex(n: int): seq[float] =
 
 proc jointModel(
     x: seq[float], slots: seq[array[DrcParam, int]], curveIds: seq[int]
-): proc(i: float, p: seq[float], grad: var seq[float]): float =
+): JointModel =
   ## The joint model: observation i's curve gets its parameters from the
   ## joint vector, and LM sees the observation index as x.
   result = proc(i: float, p: seq[float], grad: var seq[float]): float =
@@ -101,6 +115,352 @@ proc jointModel(
     grad.setZero()
     for param in DrcParam:
       grad[curveSlots[param]] += g5[ord(param)]
+
+iterator slotsOf(fit: MultiFit, param: DrcParam): int =
+  ## Each slot of `param` in the joint vector: one if it is shared, else one
+  ## per curve.
+  for c in 0 ..< (if param in fit.shared: 1 else: fit.slots.len):
+    yield fit.slots[c][param]
+
+func freeCount(fit: MultiFit): int =
+  ## The number of free joint parameters.
+  for free in fit.jointFree:
+    if free:
+      inc result
+
+proc slotBounds(fit: MultiFit): tuple[lower, upper: seq[float]] =
+  result.lower = newSeq[float](fit.joint.len)
+  result.upper = newSeq[float](fit.joint.len)
+  for slots in fit.slots:
+    for param in DrcParam:
+      result.lower[slots[param]] = fit.lower[param]
+      result.upper[slots[param]] = fit.upper[param]
+
+proc layoutJoint(fit: var MultiFit, curves: int) =
+  ## Lays out the joint vector for `curves` curves (`slots`, `joint` and
+  ## `jointFree`) from `shared` and `fixed`. Fixed slots hold their value
+  ## from the start, and the rest 0.
+  fit.slots = newSeq[array[DrcParam, int]](curves)
+  for param in DrcParam:
+    let copies = if param in fit.shared: 1 else: curves
+    for k in 0 ..< copies:
+      for c in 0 ..< curves:
+        if copies == 1 or c == k:
+          fit.slots[c][param] = fit.joint.len
+      fit.joint.add fit.fixedValues[ord(param)]
+      fit.jointFree.add param notin fit.fixed
+
+proc problem(fit: MultiFit): JointProblem =
+  ## The least-squares problem of the fit's data and layout.
+  result = JointProblem(
+    model: jointModel(logDoses(fit.data.doses), fit.slots, fit.curveIds),
+    obs: observationIndex(fit.data.doses.len),
+    y: fit.data.responses,
+    w: fit.data.weights,
+    free: fit.jointFree,
+  )
+  (result.lower, result.upper) = fit.slotBounds
+
+proc solve(
+    problem: JointProblem, start: seq[float], free: seq[bool], opts: FitOptions
+): LMDynResult =
+  ## One Levenberg–Marquardt run from `start`, over the slots in `free`.
+  levenbergMarquardt(
+    problem.model, problem.obs, problem.y, problem.w, start, free, problem.lower,
+    problem.upper, opts.lm,
+  )
+
+proc search(
+    problem: JointProblem, starts: seq[seq[float]], free: seq[bool], opts: FitOptions
+): LMDynResult =
+  ## The best of the Levenberg–Marquardt runs from each of `starts`.
+  for k, start in starts:
+    let r = problem.solve(start, free, opts)
+    if k == 0 or r.better(result):
+      result = r
+
+func nonZero(data: CurveData): int =
+  ## The curve's observations with non-zero weight.
+  for w in data.weights:
+    if w > 0.0:
+      inc result
+
+proc curveStart(
+    fit: MultiFit,
+    data: CurveData,
+    fixed: openArray[(DrcParam, float)],
+    bounds: openArray[(DrcParam, Slice[float])],
+    opts: FitOptions,
+): ParamVec =
+  ## Starting values for one curve: its own fit where it has enough data and
+  ## that fit is finite, else the guess, within the bounds.
+  if data.nonZero >= max(drcParamCount - card(fit.fixed), 1):
+    result = fitCurve(
+      fit.model, data.doses, data.responses, data.weights, fixed, bounds, opts
+    ).params.toVec
+    var finite = true
+    for v in result:
+      finite = finite and v.isFinite
+    if finite:
+      return
+  result = guessStart(
+    logDoses(data.doses), data.responses, data.weights, fit.fixedValues, fit.fixed
+  )
+  for param in DrcParam:
+    result[ord(param)] = clamp(result[ord(param)], fit.lower[param], fit.upper[param])
+
+proc gridStarts(fit: MultiFit, start: seq[float]): seq[seq[float]] =
+  ## As the single-curve search: `start` with every LogEC50 shifted by ±1 and
+  ## every Hill scaled by 0.4 or 2.5.
+  for shift in [0.0, -1.0, 1.0]:
+    for scale in [1.0, 0.4, 2.5]:
+      if (shift == 0.0 and scale == 1.0) or (shift != 0.0 and LogEC50 in fit.fixed) or
+          (scale != 1.0 and Hill in fit.fixed):
+        continue
+      var p = start
+      for slot in fit.slotsOf(LogEC50):
+        p[slot] += shift
+      for slot in fit.slotsOf(Hill):
+        p[slot] *= scale
+      result.add p
+
+proc jointStarts(
+    fit: MultiFit,
+    curveData: seq[CurveData],
+    fixed: openArray[(DrcParam, float)],
+    bounds: openArray[(DrcParam, Slice[float])],
+    opts: FitOptions,
+): seq[seq[float]] =
+  ## The joint vectors to start the search from. The first has each curve's
+  ## own starting values (see `curveStart`), with shared parameters at the
+  ## typical value over curves. Then comes one with the shared parameters from
+  ## the pooled curve and, with `opts.multiStart`, the grid of `gridStarts`.
+  var singleOpts = opts
+  singleOpts.fallback = false
+  singleOpts.loss = Squared # a robust fit reweights from the least-squares one
+  var single: seq[ParamVec]
+  for data in curveData:
+    single.add fit.curveStart(data, fixed, bounds, singleOpts)
+
+  let sharedFree = fit.shared - fit.fixed
+  var first = fit.joint
+  for param in DrcParam:
+    if param in fit.fixed:
+      continue
+    if param in fit.shared:
+      var values: seq[float]
+      for s in single:
+        values.add s[ord(param)]
+      first[fit.slots[0][param]] =
+        clamp(sharedStart(param, values), fit.lower[param], fit.upper[param])
+    else:
+      for c, s in single:
+        first[fit.slots[c][param]] = s[ord(param)]
+  result.add first
+  if sharedFree != {} and fit.n >= max(drcParamCount - card(fit.fixed), 1):
+    # The pooled curve is a good guess for the shared parameters.
+    let pooled = fitCurve(
+      fit.model, fit.data.doses, fit.data.responses, fit.data.weights, fixed, bounds,
+      singleOpts,
+    ).params
+    var second = first
+    for param in sharedFree:
+      if pooled[param].isFinite:
+        second[fit.slots[0][param]] = pooled[param]
+    result.add second
+  if opts.multiStart:
+    result.add fit.gridStarts(first)
+
+proc searchJoint(
+    problem: JointProblem, fit: MultiFit, starts: seq[seq[float]], opts: FitOptions
+): LMDynResult =
+  ## The best fit from `starts` (the main one first). As for one curve, a 5PL
+  ## fits symmetric curves first and then releases Asymmetry.
+  if Asymmetry in fit.fixed:
+    return problem.search(starts, problem.free, opts)
+  let symmetric = clamp(1.0, fit.lower[Asymmetry], fit.upper[Asymmetry])
+  var
+    symFree = problem.free
+    symStarts = starts
+  for slot in fit.slotsOf(Asymmetry):
+    symFree[slot] = false
+    for s in symStarts.mitems:
+      s[slot] = symmetric
+  result = problem.search(symStarts, symFree, opts)
+  let released = problem.search(@[result.params, starts[0]], problem.free, opts)
+  if released.better(result):
+    result = released
+
+proc fallback(
+    problem: JointProblem, start: seq[float], opts: FitOptions
+): tuple[fit: LMDynResult, converged: bool] =
+  ## As for one curve: Nelder–Mead from `start`, then Levenberg–Marquardt to
+  ## polish. It has converged if either stage has.
+  let nm = nelderMead(
+    proc(p: seq[float]): float =
+      weightedSsr(problem.model, problem.obs, problem.y, problem.w, p),
+    start,
+    problem.free,
+    problem.lower,
+    problem.upper,
+    opts.nelderMead,
+  )
+  result.fit = problem.solve(nm.params, problem.free, opts)
+  result.converged = result.fit.status.converged or nm.converged
+
+proc setUncertainty(
+    fit: var MultiFit, problem: JointProblem, robustScale: float, u: seq[float]
+) =
+  ## `ssr`, `df`, `sigma` and the joint covariance at the final estimates, as
+  ## for a single curve, with parameters at a bound counted as free (as R's
+  ## nls with algorithm = "port"). For a robust fit, `robustScale` is its
+  ## scale and `u` the residuals in units of it.
+  let nFree = fit.freeCount
+  var
+    jtwj, unscaled: seq[seq[float]]
+    gradient: seq[float]
+  fit.ssr = normalEquations(
+    problem.model, problem.obs, problem.y, problem.w, fit.joint, jtwj, gradient
+  )
+  if not unscaledCovariance(jtwj, fit.jointFree, unscaled):
+    fit.warnings.incl fwSingular
+  fit.df = fit.n - nFree
+  if fit.df == 0:
+    fit.warnings.incl fwNoResidualDf
+  var varianceScale: float
+  if fit.loss == Squared:
+    fit.sigma =
+      if fit.df > 0:
+        sqrt(fit.ssr / float(fit.df))
+      else:
+        NaN
+    varianceScale = fit.sigma ^ 2
+  else:
+    fit.sigma = robustScale
+    varianceScale = robustVarianceScale(
+      fit.loss, fit.tuning, u, problem.w, robustScale, nFree, fit.n, fit.df
+    )
+  let np = fit.joint.len
+  fit.jointCov = newSeq[seq[float]](np)
+  for i in 0 ..< np:
+    fit.jointCov[i] = newSeq[float](np)
+    for j in 0 ..< np:
+      if fit.jointFree[i] and fit.jointFree[j]:
+        fit.jointCov[i][j] = varianceScale * unscaled[i][j]
+
+proc setGoodnessOfFit(fit: var MultiFit, sst: float) =
+  ## `rSquared` from `ssr` and the total sum of squares `sst`, and the
+  ## likelihood criteria (NaN for a robust fit).
+  fit.rSquared = 1.0 - fit.ssr / sst
+  (fit.logLik, fit.aic, fit.bic) =
+    if fit.loss == Squared:
+      likelihoodCriteria(fit.ssr, fit.n, fit.freeCount, fit.data.weights)
+    else:
+      (NaN, NaN, NaN)
+
+proc curveView(fit: MultiFit, c: int, data: CurveData): DrcFit =
+  ## Curve `c` of the finished joint fit as a `DrcFit`: its parameters and
+  ## covariance block, with the joint σ and df so intervals and bands account
+  ## for the pooled fit. Its n, SSR, R², dose range and bound and EC50
+  ## warnings are its own.
+  result.model = fit.model
+  result.fixed = fit.fixed
+  (result.lower, result.upper) = (fit.lower, fit.upper)
+  result.loss = fit.loss
+  result.tuning = fit.tuning
+  if fit.loss != Squared:
+    for i, id in fit.curveIds:
+      if id == c:
+        result.robustWeights.add fit.robustWeights[i]
+  for param in DrcParam:
+    result.params[param] = fit.joint[fit.slots[c][param]]
+    for other in DrcParam:
+      result.cov[param][other] = fit.jointCov[fit.slots[c][param]][fit.slots[c][other]]
+  for param in DrcParam:
+    result.se[param] = sqrt(result.cov[param][param])
+  result.jointView = true
+  (result.doses, result.responses, result.weights) = data
+  result.df = fit.df
+  result.sigma = fit.sigma
+
+  result.n = data.nonZero
+  result.logDoseRange = nonZeroLogDoseRange(data.doses, data.weights)
+  let p = result.params.toVec
+  var grad: ParamVec
+  for i, x in logDoses(data.doses):
+    if data.weights[i] > 0.0:
+      result.ssr += data.weights[i] * (data.responses[i] - ll5(x, p, grad)) ^ 2
+  result.rSquared = 1.0 - result.ssr / totalSumOfSquares(data.responses, data.weights)
+  (result.logLik, result.aic, result.bic) = (NaN, NaN, NaN)
+
+  result.converged = fit.converged
+  result.usedFallback = fit.usedFallback
+  result.fallbackConverged = fit.fallbackConverged
+  result.iterations = fit.iterations
+  result.status = fit.status
+  result.warnings = fit.warnings - {fwAtBound, fwEc50OutsideRange}
+  result.flagBounds
+  result.flagEc50Range
+
+proc curveCount(curve: openArray[int]): int =
+  ## The number of curves: one more than the largest id.
+  for c in curve:
+    if c < 0:
+      raise newException(ValueError, "curve ids must be non-negative, got " & $c)
+    result = max(result, c + 1)
+
+proc setData(
+    fit: var MultiFit,
+    doses, responses: openArray[float],
+    curve: openArray[int],
+    weights: openArray[float],
+): seq[CurveData] =
+  ## Checks the observations and stores them in `fit`, with weights of 1 if
+  ## none are given (`data`, `dataHash`, `curveIds`, `n`). Returns each
+  ## curve's own observations.
+  result = newSeq[CurveData](curveCount(curve))
+  var w = newSeq[float](doses.len)
+  for i, c in curve:
+    w[i] =
+      if weights.len == 0:
+        1.0
+      else:
+        weights[i]
+    checkObservation(doses[i], responses[i], w[i])
+    if w[i] > 0.0:
+      inc fit.n
+    result[c].doses.add doses[i]
+    result[c].responses.add responses[i]
+    result[c].weights.add w[i]
+  for c, data in result:
+    if data.nonZero == 0:
+      raise newException(
+        ValueError, "curve " & $c & " has no observations with non-zero weight"
+      )
+  fit.curveIds = @curve
+  fit.dataHash = !$(hash(@doses) !& hash(@responses) !& hash(w))
+  fit.data = (@doses, @responses, w)
+
+proc checkCounts(fit: MultiFit, curveData: seq[CurveData]) =
+  ## Raises unless there are as many observations with non-zero weight as
+  ## free joint parameters, and in each curve as many as its unshared ones.
+  let
+    nFree = fit.freeCount
+    unshared = drcParamCount - card(fit.shared)
+  if fit.n < max(nFree, 1):
+    raise newException(
+      ValueError,
+      "need at least " & $max(nFree, 1) & " observations with " &
+        "non-zero weight to fit " & $nFree & " parameters, got " & $fit.n,
+    )
+  for c, data in curveData:
+    if data.nonZero < unshared:
+      raise newException(
+        ValueError,
+        "curve " & $c & " has " & $data.nonZero &
+          " observations with non-zero weight, fewer than its " & $unshared &
+          " unshared parameters",
+      )
 
 proc fitMultiFrom(
     model: Model,
@@ -133,225 +493,55 @@ proc fitMultiFrom(
     result.lower[param] = box.lower[ord(param)]
     result.upper[param] = box.upper[ord(param)]
   result.fixedValues = fixedValues
-  result.curveIds = @curve
   result.loss = opts.loss
   result.tuning = resolveTuning(opts)
 
-  var m = 0
-  for c in curve:
-    if c < 0:
-      raise newException(ValueError, "curve ids must be non-negative, got " & $c)
-    m = max(m, c + 1)
-  var
-    x = logDoses(doses)
-    w = newSeq[float](doses.len)
-    nCurve = newSeq[int](m)
-    sumW, sumWY, sumLogW = 0.0
-  for i in 0 ..< doses.len:
-    w[i] =
-      if weights.len == 0:
-        1.0
-      else:
-        weights[i]
-    checkObservation(doses[i], responses[i], w[i])
-    if w[i] > 0.0:
-      inc nCurve[curve[i]]
-      inc result.n
-      sumW += w[i]
-      sumWY += w[i] * responses[i]
-      sumLogW += ln(w[i])
-  for c in 0 ..< m:
-    if nCurve[c] == 0:
-      raise newException(
-        ValueError, "curve " & $c & " has no observations with non-zero weight"
-      )
-  result.dataHash = !$(hash(@doses) !& hash(@responses) !& hash(w))
-  result.data = (@doses, @responses, w)
-
-  # Layout of the joint vector; fixed slots hold their value from the start.
-  result.slots = newSeq[array[DrcParam, int]](m)
-  var lower, upper: seq[float] # bounds on each slot
-  for param in DrcParam:
-    let copies = if param in result.shared: 1 else: m
-    for k in 0 ..< copies:
-      for c in 0 ..< m:
-        if copies == 1 or c == k:
-          result.slots[c][param] = result.joint.len
-      result.joint.add fixedValues[ord(param)]
-      result.jointFree.add param notin fixedParams
-      lower.add box.lower[ord(param)]
-      upper.add box.upper[ord(param)]
-  var nFree = 0
-  for f in result.jointFree:
-    if f:
-      inc nFree
-  let unshared = drcParamCount - card(result.shared)
-  if result.n < max(nFree, 1):
-    raise newException(
-      ValueError,
-      "need at least " & $max(nFree, 1) & " observations with " &
-        "non-zero weight to fit " & $nFree & " parameters, got " & $result.n,
-    )
-  for c in 0 ..< m:
-    if nCurve[c] < unshared:
-      raise newException(
-        ValueError,
-        "curve " & $c & " has " & $nCurve[c] &
-          " observations with non-zero weight, fewer than its " & $unshared &
-          " unshared parameters",
-      )
-
-  # Each curve's own data, for its starting values and its view.
-  var curveData = newSeq[tuple[doses, responses, weights: seq[float]]](m)
-  for i, c in curve:
-    curveData[c].doses.add doses[i]
-    curveData[c].responses.add responses[i]
-    curveData[c].weights.add w[i]
+  let curveData = result.setData(doses, responses, curve, weights)
+  result.layoutJoint(curveData.len)
+  result.checkCounts(curveData)
 
   let
-    obs = observationIndex(doses.len)
-    ys = @responses
-    joint = jointModel(x, result.slots, result.curveIds)
-
-  proc search(starts: seq[seq[float]], free: seq[bool]): LMDynResult =
-    for k, start in starts:
-      let r = levenbergMarquardt(joint, obs, ys, w, start, free, lower, upper, opts.lm)
-      if k == 0 or r.better(result):
-        result = r
-
-  var
-    best: LMDynResult
-    firstStart: seq[float] # for the fallback, if no fit has a finite SSR
-  if warm:
-    firstStart = start
-    best = search(@[start], result.jointFree)
-  else:
-    # Starting values: each curve fitted on its own where it has enough data,
-    # with shared parameters started at the typical value over curves.
-    var singleOpts = opts
-    singleOpts.fallback = false
-    singleOpts.loss = Squared # a robust fit reweights from the least-squares one
-    let curveFree = drcParamCount - card(fixedParams)
-    var single = newSeq[ParamVec](m)
-    for c in 0 ..< m:
-      let (dc, rc, wc) = curveData[c]
-      var gx, gy: seq[float]
-      for k in 0 ..< dc.len:
-        if wc[k] > 0.0:
-          gx.add log10(dc[k])
-          gy.add rc[k]
-      var ok = false
-      if nCurve[c] >= max(curveFree, 1):
-        single[c] = fitCurve(model, dc, rc, wc, fixed, bounds, singleOpts).params.toVec
-        ok = true
-        for v in single[c]:
-          ok = ok and v.isFinite
-      if not ok:
-        single[c] = drcGuess(gx, gy, fixedValues, fixedParams)
-        for j in 0 ..< drcParamCount:
-          single[c][j] = clamp(single[c][j], box.lower[j], box.upper[j])
-
-    var startA = result.joint
-    for param in DrcParam:
-      if param in fixedParams:
-        continue
-      if param in shared:
-        var values: seq[float]
-        for c in 0 ..< m:
-          values.add single[c][ord(param)]
-        startA[result.slots[0][param]] = clamp(
-          sharedStart(param, values), box.lower[ord(param)], box.upper[ord(param)]
-        )
+    problem = result.problem
+    starts =
+      if warm:
+        @[start]
       else:
-        for c in 0 ..< m:
-          startA[result.slots[c][param]] = single[c][ord(param)]
-    firstStart = startA
-    var starts = @[startA]
-    if shared - fixedParams != {} and result.n >= max(curveFree, 1):
-      # The pooled curve is a good guess for the shared parameters.
-      let pooled =
-        fitCurve(model, doses, responses, w, fixed, bounds, singleOpts).params
-      var startB = startA
-      for param in shared - fixedParams:
-        if pooled[param].isFinite:
-          startB[result.slots[0][param]] = pooled[param]
-      starts.add startB
-    if opts.multiStart:
-      # As the single-curve search: shift every LogEC50 by ±1 and scale every Hill.
-      for shift in [0.0, -1.0, 1.0]:
-        for scale in [1.0, 0.4, 2.5]:
-          if (shift == 0.0 and scale == 1.0) or (
-            shift != 0.0 and LogEC50 in fixedParams
-          ) or (scale != 1.0 and Hill in fixedParams):
-            continue
-          var p = startA
-          for param in [LogEC50, Hill]:
-            var done: seq[int]
-            for c in 0 ..< m:
-              let slot = result.slots[c][param]
-              if slot notin done:
-                done.add slot
-                if param == LogEC50:
-                  p[slot] += shift
-                else:
-                  p[slot] *= scale
-          starts.add p
-
-    if Asymmetry notin fixedParams:
-      # As for one curve: fit symmetric curves first, then release Asymmetry.
-      var symFree = result.jointFree
-      var symStarts = starts
-      for c in 0 ..< m:
-        symFree[result.slots[c][Asymmetry]] = false
-      for s in symStarts.mitems:
-        for c in 0 ..< m:
-          s[result.slots[c][Asymmetry]] =
-            clamp(1.0, box.lower[ord(Asymmetry)], box.upper[ord(Asymmetry)])
-      best = search(symStarts, symFree)
-      let released = search(@[best.params, startA], result.jointFree)
-      if released.better(best):
-        best = released
+        result.jointStarts(curveData, fixed, bounds, opts)
+  var best =
+    if warm:
+      problem.solve(start, problem.free, opts)
     else:
-      best = search(starts, result.jointFree)
-
+      problem.searchJoint(result, starts, opts)
   result.converged = best.status.converged
   if opts.fallback and not result.converged:
-    # As for one curve: Nelder–Mead, then Levenberg–Marquardt to polish.
-    let nm = nelderMead(
-      proc(p: seq[float]): float =
-        weightedSsr(joint, obs, ys, w, p),
-      if best.ssr.isFinite: best.params else: firstStart,
-      result.jointFree,
-      lower,
-      upper,
-      opts.nelderMead,
+    let fb = problem.fallback(
+      if best.ssr.isFinite:
+        best.params
+      else:
+        starts[0],
+      opts,
     )
-    best = levenbergMarquardt(
-      joint, obs, ys, w, nm.params, result.jointFree, lower, upper, opts.lm
-    )
+    best = fb.fit
     result.usedFallback = true
-    result.fallbackConverged = best.status.converged or nm.converged
-    result.converged = result.fallbackConverged
-
-  let meanY = sumWY / sumW
-  var sst = 0.0
-  for i in 0 ..< doses.len:
-    sst += w[i] * (responses[i] - meanY) ^ 2
+    result.fallbackConverged = fb.converged
+    result.converged = fb.converged
 
   # A robust fit reweights from the least-squares fit, as for one curve.
+  let sst = totalSumOfSquares(problem.y, problem.w)
   var
     robust: IrlsResult[LMDynResult]
     u: seq[float] # residuals in units of the robust scale
   if result.loss != Squared:
     robust = robustFit(
-      joint, obs, ys, w, best, result.jointFree, lower, upper, result.loss,
-      result.tuning, sst, result.n, opts,
+      problem.model, problem.obs, problem.y, problem.w, best, problem.free,
+      problem.lower, problem.upper, result.loss, result.tuning, sst, result.n, opts,
     )
     best = robust.fit
     result.converged = best.status.converged
     if not robust.converged:
       result.warnings.incl fwRobustNotConverged
-    (u, result.robustWeights) = robust.robustUnits(w, result.loss, result.tuning)
+    (u, result.robustWeights) =
+      robust.robustUnits(problem.w, result.loss, result.tuning)
 
   result.joint = best.params
   result.iterations = best.iterations
@@ -359,120 +549,21 @@ proc fitMultiFrom(
   if not result.converged:
     result.warnings.incl fwNotConverged
   result.converged = result.warnings * {fwNotConverged, fwRobustNotConverged} == {}
-  for c in 0 ..< m:
-    for param in DrcParam:
-      let slot = result.slots[c][param]
-      if result.jointFree[slot] and result.joint[slot] in [lower[slot], upper[slot]]:
-        result.atBound.incl param
+  for param in DrcParam:
+    if param notin result.fixed:
+      for slot in result.slotsOf(param):
+        if result.joint[slot] in [result.lower[param], result.upper[param]]:
+          result.atBound.incl param
   if result.atBound != {}:
     result.warnings.incl fwAtBound
 
-  # Uncertainty, as for a single curve, over the joint vector, with parameters
-  # at a bound counted as free (as R's nls with algorithm = "port").
-  var
-    jtwj, unscaled: seq[seq[float]]
-    gradient: seq[float]
-  result.ssr = normalEquations(joint, obs, responses, w, result.joint, jtwj, gradient)
-  if not unscaledCovariance(jtwj, result.jointFree, unscaled):
-    result.warnings.incl fwSingular
-  result.df = result.n - nFree
-  if result.df == 0:
-    result.warnings.incl fwNoResidualDf
-  var varianceScale: float
-  if result.loss == Squared:
-    result.sigma =
-      if result.df > 0:
-        sqrt(result.ssr / float(result.df))
-      else:
-        NaN
-    varianceScale = result.sigma ^ 2
-  else:
-    result.sigma = robust.scale
-    varianceScale = robustVarianceScale(
-      result.loss, result.tuning, u, w, robust.scale, nFree, result.n, result.df
-    )
-  let np = result.joint.len
-  result.jointCov = newSeq[seq[float]](np)
-  for i in 0 ..< np:
-    result.jointCov[i] = newSeq[float](np)
-    for j in 0 ..< np:
-      if result.jointFree[i] and result.jointFree[j]:
-        result.jointCov[i][j] = varianceScale * unscaled[i][j]
-
-  result.rSquared = 1.0 - result.ssr / sst
-  if result.loss == Squared:
-    result.logLik = gaussianLogLik(result.ssr, result.n, sumLogW)
-    let k = float(nFree + 1) # free parameters plus σ
-    result.aic = -2.0 * result.logLik + 2.0 * k
-    result.bic = -2.0 * result.logLik + ln(float(result.n)) * k
-  else:
-    (result.logLik, result.aic, result.bic) = (NaN, NaN, NaN)
-
-  # Each curve as a DrcFit: its parameters and covariance block, with the
-  # joint σ and df so intervals and bands account for the pooled fit.
-  for c in 0 ..< m:
-    var v: DrcFit
-    v.model = model
-    v.fixed = fixedParams
-    (v.lower, v.upper) = (result.lower, result.upper)
-    v.loss = result.loss
-    v.tuning = result.tuning
-    if result.loss != Squared:
-      for i in 0 ..< doses.len:
-        if curve[i] == c:
-          v.robustWeights.add result.robustWeights[i]
-    for param in DrcParam:
-      v.params[param] = result.joint[result.slots[c][param]]
-      for other in DrcParam:
-        v.cov[param][other] =
-          result.jointCov[result.slots[c][param]][result.slots[c][other]]
-    for param in DrcParam:
-      v.se[param] = sqrt(v.cov[param][param])
-    v.n = nCurve[c]
-    v.jointView = true
-    (v.doses, v.responses, v.weights) = curveData[c]
-    v.df = result.df
-    v.sigma = result.sigma
-    var
-      cw, cwy = 0.0
-      lo = Inf
-      hi = NegInf
-      grad: ParamVec
-    for i in 0 ..< doses.len:
-      if curve[i] == c and w[i] > 0.0:
-        cw += w[i]
-        cwy += w[i] * responses[i]
-        v.ssr += w[i] * (responses[i] - ll5(x[i], v.params.toVec, grad)) ^ 2
-        if x[i] > NegInf:
-          lo = min(lo, x[i])
-          hi = max(hi, x[i])
-    var cst = 0.0
-    for i in 0 ..< doses.len:
-      if curve[i] == c and w[i] > 0.0:
-        cst += w[i] * (responses[i] - cwy / cw) ^ 2
-    v.rSquared = 1.0 - v.ssr / cst
-    (v.logLik, v.aic, v.bic) = (NaN, NaN, NaN)
-    v.logDoseRange =
-      if lo <= hi:
-        (lo, hi)
-      else:
-        (NaN, NaN)
-    v.converged = result.converged
-    v.usedFallback = result.usedFallback
-    v.fallbackConverged = result.fallbackConverged
-    v.iterations = result.iterations
-    v.status = result.status
-    v.warnings = result.warnings - {fwAtBound}
-    for param in DrcParam:
-      if param notin fixedParams and v.params[param] in [v.lower[param], v.upper[param]]:
-        v.atBound.incl param
-    if v.atBound != {}:
-      v.warnings.incl fwAtBound
-    let logEC50 = log10(v.ec50)
-    if not (logEC50 >= v.logDoseRange.lower and logEC50 <= v.logDoseRange.upper):
-      v.warnings.incl fwEc50OutsideRange
+  result.setUncertainty(problem, robust.scale, u)
+  result.setGoodnessOfFit(sst)
+  for c, data in curveData:
+    result.curves.add result.curveView(c, data)
+  for view in result.curves:
+    if fwEc50OutsideRange in view.warnings:
       result.warnings.incl fwEc50OutsideRange
-    result.curves.add v
 
 proc fitMulti*(
     model: Model,
@@ -591,29 +682,35 @@ proc relativePotency*(
   let half = fit.curves[a].tQuantile(level) * sqrt(variance)
   (pow(10.0, center), (pow(10.0, center - half), pow(10.0, center + half)))
 
-proc slotBounds(fit: MultiFit): tuple[lower, upper: seq[float]] =
-  result.lower = newSeq[float](fit.joint.len)
-  result.upper = newSeq[float](fit.joint.len)
-  for slots in fit.slots:
-    for param in DrcParam:
-      result.lower[slots[param]] = fit.lower[param]
-      result.upper[slots[param]] = fit.upper[param]
-
 proc checkProfile(fit: MultiFit) =
   if fit.loss != Squared:
     raise
       newException(ValueError, "profile-likelihood intervals need a least-squares fit")
 
-proc profileModel(
-    fit: MultiFit
-): tuple[
-  model: proc(i: float, p: seq[float], grad: var seq[float]): float,
-  obs, lower, upper: seq[float],
-] =
-  ## The joint model, its x (the observation index) and the bounds on each slot.
-  result.model = jointModel(logDoses(fit.data.doses), fit.slots, fit.curveIds)
-  result.obs = observationIndex(fit.data.doses.len)
-  (result.lower, result.upper) = fit.slotBounds
+func antilog(ci: ConfInt): ConfInt =
+  (pow(10.0, ci.lower), pow(10.0, ci.upper))
+
+proc pinnedTau(
+    fit: MultiFit, problem: JointProblem, slot: int, opts: FitOptions
+): ProfileTau[seq[float]] =
+  ## τ for slot `slot` of `problem`'s parameter vector: each refit holds it
+  ## at β. `problem` is the fit's, or has a model that fits equally well.
+  pinnedTau(
+    problem.model, problem.obs, problem.y, problem.w, slot, problem.free, problem.lower,
+    problem.upper, fit.ssr, fit.sigma, opts.lm,
+  )
+
+proc constrainedInterval[G](
+    fit: MultiFit, g: G, tq, se: float, opts: FitOptions
+): ConfInt =
+  ## The profile-likelihood interval for g(joint vector), whose delta-method
+  ## standard error is `se`: each refit of the joint model is constrained to
+  ## g (see `constrainedInterval` for one curve).
+  let problem = fit.problem
+  constrainedInterval(
+    problem.model, g, problem.obs, problem.y, problem.w, fit.joint, problem.free,
+    problem.lower, problem.upper, fit.ssr, fit.sigma, tq, se, opts.lm,
+  )
 
 proc profileCI*(
     fit: MultiFit, curve: int, param: DrcParam, level = 0.95, opts = FitOptions()
@@ -628,16 +725,12 @@ proc profileCI*(
   let slot = fit.slots[curve][param]
   if not fit.jointFree[slot]:
     return (fit.joint[slot], fit.joint[slot])
-  let (model, obs, lower, upper) = fit.profileModel
   profileInterval(
-    pinnedTau(
-      model, obs, fit.data.responses, fit.data.weights, slot, fit.jointFree, lower,
-      upper, fit.ssr, fit.sigma, opts.lm,
-    ),
+    fit.pinnedTau(fit.problem, slot, opts),
     fit.joint,
     fit.joint[slot],
-    lower[slot],
-    upper[slot],
+    fit.lower[param],
+    fit.upper[param],
     fit.sigma,
     tq,
     sqrt(fit.jointCov[slot][slot]),
@@ -658,81 +751,39 @@ proc ecxProfileCI*(
   let view = fit.curves[curve]
   let tq = view.tQuantile(level)
   let (_, grad) = view.logEcxAndGradient(pct)
-  let (model, obs, lower, upper) = fit.profileModel
-  let ci = constrainedInterval(
-    model,
+  let ci = fit.constrainedInterval(
     logEcxConstraint[seq[float]](fit.slots[curve], fractionAt(view.params[Hill], pct)),
-    obs,
-    fit.data.responses,
-    fit.data.weights,
-    fit.joint,
-    fit.jointFree,
-    lower,
-    upper,
-    fit.ssr,
-    fit.sigma,
     tq,
     sqrt(view.deltaVariance(grad, LogEC50 .. Asymmetry)),
-    opts.lm,
+    opts,
   )
-  (pow(10.0, ci.lower), pow(10.0, ci.upper))
+  antilog(ci)
 
 proc ec50ProfileCI*(
     fit: MultiFit, curve: int, level = 0.95, opts = FitOptions()
 ): ConfInt =
   fit.ecxProfileCI(curve, 50.0, level, opts)
 
-proc relativePotencyProfileCI*(
-    fit: MultiFit, a, b: int, pct = 50.0, level = 0.95, opts = FitOptions()
-): ConfInt =
-  ## Profile-likelihood confidence interval for `relativePotency(a, b, pct)`.
-  ## The joint model is rewritten with log10(ECx) of curve `b` and
-  ## log10(ECx(a)/ECx(b)) in place of the two curves' LogEC50s, and the log
-  ## ratio is profiled as in `profileCI`, then back-transformed. An end is 0
-  ## or Inf if the data do not bound the ratio within 10·t standard errors.
-  ## If LogEC50 is shared, fixed or bounded, each refit is instead
-  ## constrained to the log ratio. If the ratio depends on no free parameter
-  ## (the EC50s of 4PL curves that share LogEC50), the interval is the
-  ## estimate. Least-squares fits only. `opts.lm` controls the refits.
-  if a == b:
-    raise newException(ValueError, "the two curves must differ")
-  let (center, variance) = fit.logPotency(a, b, pct)
-  let tq = fit.curves[a].tQuantile(level)
-  fit.checkProfile
-  if LogEC50 in fit.shared or fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
-    let
-      ga =
-        logEcxConstraint[seq[float]](fit.slots[a], fractionAt(fit.param(a, Hill), pct))
-      gb =
-        logEcxConstraint[seq[float]](fit.slots[b], fractionAt(fit.param(b, Hill), pct))
-      ratio = proc(q: seq[float], grad: var seq[float]): float =
-        var gradB = newSeq[float](q.len)
-        result = ga(q, grad) - gb(q, gradB)
-        for i in 0 ..< q.len:
-          grad[i] -= gradB[i]
-      (model, obs, lower, upper) = fit.profileModel
-      ci = constrainedInterval(
-        model,
-        ratio,
-        obs,
-        fit.data.responses,
-        fit.data.weights,
-        fit.joint,
-        fit.jointFree,
-        lower,
-        upper,
-        fit.ssr,
-        fit.sigma,
-        tq,
-        sqrt(variance),
-        opts.lm,
-      )
-    return (pow(10.0, ci.lower), pow(10.0, ci.upper))
+proc logPotencyConstraint(
+    fit: MultiFit, a, b: int, pct: float
+): proc(q: seq[float], grad: var seq[float]): float =
+  ## g(joint vector) = log10(ECx of curve a / ECx of curve b), with its
+  ## gradient.
+  let
+    ga = logEcxConstraint[seq[float]](fit.slots[a], fractionAt(fit.param(a, Hill), pct))
+    gb = logEcxConstraint[seq[float]](fit.slots[b], fractionAt(fit.param(b, Hill), pct))
+  result = proc(q: seq[float], grad: var seq[float]): float =
+    var gradB = newSeq[float](q.len)
+    result = ga(q, grad) - gb(q, gradB)
+    for i in 0 ..< q.len:
+      grad[i] -= gradB[i]
 
-  # q is the joint vector with q[sb] = log10 ECx(b) and q[sa] = the log ratio,
-  # so LogEC50(b) = q[sb] + z_b/Hill_b and LogEC50(a) = q[sa] + q[sb] + z_a/Hill_a
-  # (see `zOffset`). Each curve's z depends only on its Asymmetry, so it is
-  # kept between calls.
+proc potencyModel(fit: MultiFit, a, b: int, pct: float): JointModel =
+  ## The joint model rewritten for the potency of curve a relative to curve b
+  ## at `pct`: in its parameter vector q, curve b's LogEC50 slot (sb) holds
+  ## log10 ECx(b) and curve a's (sa) holds log10(ECx(a)/ECx(b)), so
+  ## LogEC50(b) = q[sb] + z_b/Hill_b and LogEC50(a) = q[sa] + q[sb] + z_a/Hill_a
+  ## (see `zOffset`). The curves must not share LogEC50.
   type Shift = object
     r, cachedA, z, dzda: float
     hill, asymmetry: int # slots
@@ -745,13 +796,14 @@ proc relativePotencyProfileCI*(
       asymmetry: fit.slots[curve][Asymmetry],
     )
 
+  # Each curve's z depends only on its Asymmetry, so it is kept between calls.
   var shifts = [shift(a), shift(b)]
   let
     (sa, sb) = (fit.slots[a][LogEC50], fit.slots[b][LogEC50])
     x = logDoses(fit.data.doses)
     slots = fit.slots
     curveIds = fit.curveIds
-  let model = proc(i: float, q: seq[float], grad: var seq[float]): float =
+  result = proc(i: float, q: seq[float], grad: var seq[float]): float =
     let k = int(i)
     let c = curveIds[k]
     let curveSlots = slots[c]
@@ -785,33 +837,48 @@ proc relativePotencyProfileCI*(
         grad[sb] += dl
       grad[shifts[side].hill] -= dl * shifts[side].z / (h * h)
       grad[shifts[side].asymmetry] += dl * shifts[side].dzda / h
+
+proc relativePotencyProfileCI*(
+    fit: MultiFit, a, b: int, pct = 50.0, level = 0.95, opts = FitOptions()
+): ConfInt =
+  ## Profile-likelihood confidence interval for `relativePotency(a, b, pct)`.
+  ## The joint model is rewritten with log10(ECx) of curve `b` and
+  ## log10(ECx(a)/ECx(b)) in place of the two curves' LogEC50s, and the log
+  ## ratio is profiled as in `profileCI`, then back-transformed. An end is 0
+  ## or Inf if the data do not bound the ratio within 10·t standard errors.
+  ## If LogEC50 is shared, fixed or bounded, each refit is instead
+  ## constrained to the log ratio. If the ratio depends on no free parameter
+  ## (the EC50s of 4PL curves that share LogEC50), the interval is the
+  ## estimate. Least-squares fits only. `opts.lm` controls the refits.
+  if a == b:
+    raise newException(ValueError, "the two curves must differ")
+  let (center, variance) = fit.logPotency(a, b, pct)
+  let tq = fit.curves[a].tQuantile(level)
+  fit.checkProfile
+  if LogEC50 in fit.shared or fit.lower[LogEC50] > -Inf or fit.upper[LogEC50] < Inf:
+    return antilog(
+      fit.constrainedInterval(
+        fit.logPotencyConstraint(a, b, pct), tq, sqrt(variance), opts
+      )
+    )
+  let (sa, sb) = (fit.slots[a][LogEC50], fit.slots[b][LogEC50])
+  var problem = fit.problem
+  problem.model = fit.potencyModel(a, b, pct)
   var q = fit.joint
   q[sb] = fit.curves[b].logEcxAndGradient(pct)[0]
   q[sa] = center
-  let (lower, upper) = fit.slotBounds
-  let ci = profileInterval(
-    pinnedTau(
-      model,
-      observationIndex(x.len),
-      fit.data.responses,
-      fit.data.weights,
-      sa,
-      fit.jointFree,
-      lower,
-      upper,
-      fit.ssr,
+  antilog(
+    profileInterval(
+      fit.pinnedTau(problem, sa, opts),
+      q,
+      center,
+      -Inf,
+      Inf,
       fit.sigma,
-      opts.lm,
-    ),
-    q,
-    center,
-    -Inf,
-    Inf,
-    fit.sigma,
-    tq,
-    sqrt(variance),
+      tq,
+      sqrt(variance),
+    )
   )
-  (pow(10.0, ci.lower), pow(10.0, ci.upper))
 
 proc fTest*(reduced, full: MultiFit): FTest =
   ## F test of a reduced joint fit (e.g. parallel curves) against a fuller one

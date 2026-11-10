@@ -1077,6 +1077,179 @@ proc resolveBounds(
       )
     (result.lower[ord(param)], result.upper[ord(param)]) = (range.a, range.b)
 
+func freeMask(fixed: set[DrcParam]): array[drcParamCount, bool] =
+  ## True for each parameter not in `fixed`.
+  for param in DrcParam:
+    result[ord(param)] = param notin fixed
+
+func nonZeroLogDoseRange(doses, weights: openArray[float]): tuple[lower, upper: float] =
+  ## The smallest and largest log10 of the non-zero doses with non-zero
+  ## weight, or NaN if there are none.
+  var
+    lo = Inf
+    hi = NegInf
+  for i, dose in doses:
+    let x = log10(dose)
+    if weights[i] > 0.0 and x > NegInf:
+      lo = min(lo, x)
+      hi = max(hi, x)
+  if lo <= hi:
+    (lo, hi)
+  else:
+    (NaN, NaN)
+
+func totalSumOfSquares(y, w: openArray[float]): float =
+  ## Σ wᵢ·(yᵢ − ȳ)² about the weighted mean ȳ.
+  var sumW, sumWY = 0.0
+  for i in 0 ..< y.len:
+    sumW += w[i]
+    sumWY += w[i] * y[i]
+  let mean = sumWY / sumW
+  for i in 0 ..< y.len:
+    result += w[i] * (y[i] - mean) ^ 2
+
+proc likelihoodCriteria(
+    ssr: float, n, nFree: int, weights: openArray[float]
+): tuple[logLik, aic, bic: float] =
+  ## The Gaussian log-likelihood of a least-squares fit with `nFree` free
+  ## parameters to `n` observations with non-zero weight, and its AIC and BIC,
+  ## which count σ as a parameter (as R and drc).
+  var sumLogW = 0.0
+  for w in weights:
+    if w > 0.0:
+      sumLogW += ln(w)
+  result.logLik = gaussianLogLik(ssr, n, sumLogW)
+  let k = float(nFree + 1)
+  result.aic = -2.0 * result.logLik + 2.0 * k
+  result.bic = -2.0 * result.logLik + ln(float(n)) * k
+
+proc setData(fit: var DrcFit, doses, responses, weights: openArray[float]) =
+  ## Checks the observations and stores them in `fit`, with weights of 1 if
+  ## none are given, along with `n` and `logDoseRange`.
+  if doses.len != responses.len:
+    raise newException(ValueError, "doses and responses differ in length")
+  if weights.len != 0 and weights.len != doses.len:
+    raise newException(ValueError, "weights and doses differ in length")
+  fit.doses = @doses
+  fit.responses = @responses
+  fit.weights = newSeq[float](doses.len)
+  for i in 0 ..< doses.len:
+    fit.weights[i] =
+      if weights.len == 0:
+        1.0
+      else:
+        weights[i]
+    checkObservation(doses[i], responses[i], fit.weights[i])
+    if fit.weights[i] > 0.0:
+      inc fit.n
+  fit.logDoseRange = nonZeroLogDoseRange(fit.doses, fit.weights)
+
+proc guessStart(
+    x, y, w: openArray[float], fixedValues: ParamVec, fixed: set[DrcParam]
+): ParamVec =
+  ## `drcGuess` from the observations with non-zero weight.
+  var guessX, guessY: seq[float]
+  for i in 0 ..< x.len:
+    if w[i] > 0.0:
+      guessX.add x[i]
+      guessY.add y[i]
+  drcGuess(guessX, guessY, fixedValues, fixed)
+
+proc fallback(
+    x, y, w: seq[float],
+    start: ParamVec,
+    free: array[drcParamCount, bool],
+    box: Box,
+    opts: FitOptions,
+): tuple[fit: LMResult[drcParamCount], converged: bool] =
+  ## Nelder–Mead from `start`, which needs no derivatives, then
+  ## Levenberg–Marquardt to polish its result. Each stage only goes downhill,
+  ## so from the best fit so far the polished fit is never worse. It has
+  ## converged if either stage has.
+  let nm = nelderMead(
+    proc(p: ParamVec): float =
+      weightedSsr(ll5, x, y, w, p),
+    start,
+    free,
+    box.lower,
+    box.upper,
+    opts.nelderMead,
+  )
+  result.fit =
+    levenbergMarquardt(ll5, x, y, w, nm.params, free, box.lower, box.upper, opts.lm)
+  result.converged = result.fit.status.converged or nm.converged
+
+proc flagBounds(fit: var DrcFit) =
+  ## `atBound`, and its warning: the free parameters that are on a bound.
+  for param in DrcParam:
+    if param notin fit.fixed and
+        fit.params[param] in [fit.lower[param], fit.upper[param]]:
+      fit.atBound.incl param
+  if fit.atBound != {}:
+    fit.warnings.incl fwAtBound
+
+proc flagEc50Range(fit: var DrcFit) =
+  ## Warns if the EC50 is outside the tested doses.
+  let logEC50 = log10(fit.ec50)
+  if not (logEC50 >= fit.logDoseRange.lower and logEC50 <= fit.logDoseRange.upper):
+    fit.warnings.incl fwEc50OutsideRange
+
+proc setUncertainty(fit: var DrcFit, x: seq[float], robustScale: float, u: seq[float]) =
+  ## `ssr`, `df`, `sigma`, `cov` and `se` at the final estimates, independent
+  ## of which optimiser produced them: cov = varianceScale · (JᵀWJ)⁻¹ over the
+  ## free parameters, with varianceScale = σ² for least squares. Parameters at
+  ## a bound count as free, as in R's nls(algorithm = "port") and SciPy's
+  ## curve_fit. For a robust fit, `robustScale` is its scale and `u` the
+  ## residuals in units of it.
+  let
+    free = freeMask(fit.fixed)
+    nFree = drcParamCount - card(fit.fixed)
+  var
+    jtwj, unscaled: array[drcParamCount, array[drcParamCount, float]]
+    gradient: ParamVec
+  # Under the user weights, so robust fits report their plain weighted SSR too.
+  fit.ssr = normalEquations(
+    ll5, x, fit.responses, fit.weights, fit.params.toVec, jtwj, gradient
+  )
+  fit.df = fit.n - nFree
+  var varianceScale = NaN
+  if fit.loss == Squared:
+    fit.sigma =
+      if fit.df > 0:
+        sqrt(fit.ssr / float(fit.df))
+      else:
+        NaN
+    varianceScale = fit.sigma ^ 2
+  else:
+    fit.sigma = robustScale
+    varianceScale = robustVarianceScale(
+      fit.loss, fit.tuning, u, fit.weights, robustScale, nFree, fit.n, fit.df
+    )
+  if not unscaledCovariance(jtwj, free, unscaled):
+    fit.warnings.incl fwSingular
+  if fit.df == 0:
+    fit.warnings.incl fwNoResidualDf
+  for i in DrcParam:
+    for j in DrcParam:
+      # Fixed entries are exactly 0; a NaN σ or (JᵀWJ)⁻¹ carries through to the rest.
+      if i in fit.fixed or j in fit.fixed:
+        fit.cov[i][j] = 0.0
+      else:
+        fit.cov[i][j] = varianceScale * unscaled[ord(i)][ord(j)]
+  for param in DrcParam:
+    fit.se[param] = sqrt(fit.cov[param][param])
+
+proc setGoodnessOfFit(fit: var DrcFit, sst: float) =
+  ## `rSquared` from `ssr` and the total sum of squares `sst`, and the
+  ## likelihood criteria (NaN for a robust fit, which does not maximise the
+  ## Gaussian likelihood).
+  fit.rSquared = 1.0 - fit.ssr / sst
+  (fit.logLik, fit.aic, fit.bic) =
+    if fit.loss == Squared:
+      likelihoodCriteria(fit.ssr, fit.n, drcParamCount - card(fit.fixed), fit.weights)
+    else:
+      (NaN, NaN, NaN)
+
 proc fitCurveFrom(
     model: Model,
     doses, responses: openArray[float],
@@ -1091,54 +1264,13 @@ proc fitCurveFrom(
   ## in place of the guess and multi-start search (the fallback still
   ## applies); for refits of data close to an earlier fit's.
   result.model = model
-  if doses.len != responses.len:
-    raise newException(ValueError, "doses and responses differ in length")
-  if weights.len != 0 and weights.len != doses.len:
-    raise newException(ValueError, "weights and doses differ in length")
-
-  var
-    x = logDoses(doses)
-    w = newSeq[float](doses.len)
-    guessX, guessY: seq[float] # observations with non-zero weight
-    sumW, sumWY, sumLogW = 0.0
-    lo = Inf
-    hi = NegInf
-  for i in 0 ..< doses.len:
-    w[i] =
-      if weights.len == 0:
-        1.0
-      else:
-        weights[i]
-    checkObservation(doses[i], responses[i], w[i])
-    if w[i] > 0.0:
-      inc result.n
-      guessX.add x[i]
-      guessY.add responses[i]
-      sumW += w[i]
-      sumWY += w[i] * responses[i]
-      sumLogW += ln(w[i])
-      if x[i] > NegInf:
-        lo = min(lo, x[i])
-        hi = max(hi, x[i])
-  result.logDoseRange =
-    if lo <= hi:
-      (lo, hi)
-    else:
-      (NaN, NaN)
-  result.doses = @doses
-  result.responses = @responses
-  result.weights = w
-
+  result.setData(doses, responses, weights)
   let (fixedValues, fixedParams) = resolveFixed(model, fixed)
   result.fixed = fixedParams
-  var free: array[drcParamCount, bool]
-  for param in DrcParam:
-    free[ord(param)] = param notin fixedParams
   let box = resolveBounds(model, fixedParams, bounds)
   for param in DrcParam:
     result.lower[param] = box.lower[ord(param)]
     result.upper[param] = box.upper[ord(param)]
-
   result.loss = opts.loss
   result.tuning = resolveTuning(opts)
 
@@ -1150,53 +1282,41 @@ proc fitCurveFrom(
         "non-zero weight to fit " & $nFree & " parameters, got " & $result.n,
     )
 
+  let
+    x = logDoses(doses)
+    y = result.responses
+    w = result.weights
+    free = freeMask(result.fixed)
   var p0 =
     if warm:
       start
     else:
-      drcGuess(guessX, guessY, fixedValues, result.fixed)
+      guessStart(x, y, w, fixedValues, result.fixed)
   for j in 0 ..< drcParamCount:
     p0[j] = clamp(p0[j], box.lower[j], box.upper[j])
   var best =
     if warm:
-      levenbergMarquardt(ll5, x, responses, w, p0, free, box.lower, box.upper, opts.lm)
+      levenbergMarquardt(ll5, x, y, w, p0, free, box.lower, box.upper, opts.lm)
     else:
-      searchLM(x, responses, w, p0, free, box, opts)
+      searchLM(x, y, w, p0, free, box, opts)
   result.converged = best.status.converged
   if opts.fallback and not result.converged:
-    # Nelder–Mead needs no derivatives; Levenberg–Marquardt then polishes its result.
-    let y = @responses
-    let start = if best.ssr.isFinite: best.params else: p0
-    let nm = nelderMead(
-      proc(p: ParamVec): float =
-        weightedSsr(ll5, x, y, w, p),
-      start,
-      free,
-      box.lower,
-      box.upper,
-      opts.nelderMead,
-    )
-    # Each stage only goes downhill from the best fit so far, so the polished
-    # fit is never worse.
-    best =
-      levenbergMarquardt(ll5, x, y, w, nm.params, free, box.lower, box.upper, opts.lm)
+    let fb =
+      fallback(x, y, w, if best.ssr.isFinite: best.params else: p0, free, box, opts)
+    best = fb.fit
     result.usedFallback = true
-    result.fallbackConverged = best.status.converged or nm.converged
-    result.converged = result.fallbackConverged
-
-  let meanY = sumWY / sumW
-  var sst = 0.0
-  for i in 0 ..< responses.len:
-    sst += w[i] * (responses[i] - meanY) ^ 2
+    result.fallbackConverged = fb.converged
+    result.converged = fb.converged
 
   # A robust fit reweights from the least-squares fit.
+  let sst = totalSumOfSquares(y, w)
   var
     robust: IrlsResult[LMResult[drcParamCount]]
     u: seq[float] # residuals in units of the robust scale
   if result.loss != Squared:
     robust = robustFit(
-      ll5, x, responses, w, best, free, box.lower, box.upper, result.loss,
-      result.tuning, sst, result.n, opts,
+      ll5, x, y, w, best, free, box.lower, box.upper, result.loss, result.tuning, sst,
+      result.n, opts,
     )
     best = robust.fit
     result.converged = best.status.converged
@@ -1205,67 +1325,15 @@ proc fitCurveFrom(
     (u, result.robustWeights) = robust.robustUnits(w, result.loss, result.tuning)
 
   result.params = best.params.toParams
-  for param in DrcParam:
-    if param notin result.fixed and
-        result.params[param] in [result.lower[param], result.upper[param]]:
-      result.atBound.incl param
-  if result.atBound != {}:
-    result.warnings.incl fwAtBound
-  var
-    jtwj, unscaled: array[drcParamCount, array[drcParamCount, float]]
-    gradient: ParamVec
-  # Under the user weights, so robust fits report their plain weighted SSR too.
-  result.ssr = normalEquations(ll5, x, responses, w, best.params, jtwj, gradient)
   result.iterations = best.iterations
   result.status = best.status
-  result.df = result.n - nFree
-
   if not result.converged:
     result.warnings.incl fwNotConverged
   result.converged = result.warnings * {fwNotConverged, fwRobustNotConverged} == {}
-  let logEC50 = log10(result.ec50)
-  if not (logEC50 >= result.logDoseRange.lower and logEC50 <= result.logDoseRange.upper):
-    result.warnings.incl fwEc50OutsideRange
-
-  # Uncertainty: cov = varianceScale · (JᵀWJ)⁻¹ over the free parameters, with
-  # varianceScale = σ² for least squares. Parameters at a bound count as free,
-  # as in R's nls(algorithm = "port") and SciPy's curve_fit.
-  var varianceScale = NaN
-  if result.loss == Squared:
-    if result.df > 0:
-      result.sigma = sqrt(result.ssr / float(result.df))
-    else:
-      result.sigma = NaN
-    varianceScale = result.sigma ^ 2
-  else:
-    result.sigma = robust.scale
-    varianceScale = robustVarianceScale(
-      result.loss, result.tuning, u, w, robust.scale, nFree, result.n, result.df
-    )
-  if not unscaledCovariance(jtwj, free, unscaled):
-    result.warnings.incl fwSingular
-  if result.df == 0:
-    result.warnings.incl(fwNoResidualDf)
-  for i in DrcParam:
-    for j in DrcParam:
-      # Fixed entries are exactly 0; a NaN σ or (JᵀWJ)⁻¹ carries through to the rest.
-      if i in result.fixed or j in result.fixed:
-        result.cov[i][j] = 0.0
-      else:
-        result.cov[i][j] = varianceScale * unscaled[ord(i)][ord(j)]
-  for param in DrcParam:
-    result.se[param] = sqrt(result.cov[param][param])
-
-  # Goodness of fit.
-  result.rSquared = 1.0 - result.ssr / sst
-  if result.loss == Squared:
-    result.logLik = gaussianLogLik(result.ssr, result.n, sumLogW)
-    let k = float(nFree + 1) # free parameters plus σ
-    result.aic = -2.0 * result.logLik + 2.0 * k
-    result.bic = -2.0 * result.logLik + ln(float(result.n)) * k
-  else:
-    # A robust fit does not maximise the Gaussian likelihood.
-    (result.logLik, result.aic, result.bic) = (NaN, NaN, NaN)
+  result.flagBounds
+  result.flagEc50Range
+  result.setUncertainty(x, robust.scale, u)
+  result.setGoodnessOfFit(sst)
 
 proc fitCurve*(
     model: Model,

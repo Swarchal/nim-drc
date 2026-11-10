@@ -346,6 +346,24 @@ suite "joint fits: consistency":
     check band.lower < band.fit and band.fit < band.upper
     check view.logDoseRange.lower == log10(0.04882812)
 
+  test "an EC50 outside the dose range is flagged on its own curve only":
+    # Parallel curves: curve 0 (EC50 10) is tested up to a dose of 1, and
+    # curve 1 (EC50 1) up to 1000.
+    var
+      d, y: seq[float]
+      ids: seq[int]
+    for c, ec50 in [10.0, 1.0]:
+      for k in 0 .. (if c == 0: 6 else: 12):
+        let dose = pow(10.0, -3.0 + 0.5 * float(k))
+        d.add dose
+        y.add 2.0 + 98.0 / (1.0 + dose / ec50) + (if k mod 2 == 0: 0.4 else: -0.4)
+        ids.add c
+    let fit = fitLL4Multi(d, y, ids, shared = {Bottom, Top, Hill})
+    check fit.curves[0].ec50 > 1.0
+    check fwEc50OutsideRange in fit.curves[0].warnings
+    check fwEc50OutsideRange notin fit.curves[1].warnings
+    check fwEc50OutsideRange in fit.warnings
+
   test "summary":
     let fit = fitLL4Multi(doses, dnaseDensity, curve, shared = {Bottom, Top, Hill})
     let text = fit.summary
